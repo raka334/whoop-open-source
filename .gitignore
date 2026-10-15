@@ -1,0 +1,19 @@
+# Local secrets & data
+.env
+*.db
+*.sqlite
+*.sqlite3
+data/
+captures/
+tokens.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/

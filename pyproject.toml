@@ -1,0 +1,23 @@
+[project]
+name = "whoop-open-source"
+version = "0.1.0"
+description = "Unified WHOOP 5.0 data pipeline: official API v2 + reverse-engineered BLE into one local store."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+ble = ["bleak>=0.22"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+whoop = "whoop.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["whoop", "whoop.api", "whoop.ble"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
