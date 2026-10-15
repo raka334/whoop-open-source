@@ -80,6 +80,8 @@ def test_index_is_served_and_keeps_the_panels_apart(server):
     assert status == 200
     html = body.decode()
     assert "API source" in html and "BLE source" in html
+    # A default tab must be activated, or every <section> stays hidden on load.
+    assert 'showTab("api")' in html
     # Fully offline: no external asset, no CDN.
     assert "https://" not in html and "cdn" not in html.lower()
 

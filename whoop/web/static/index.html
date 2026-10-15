@@ -250,14 +250,16 @@ async function getJSON(path) {
 }
 
 /* ------------------------------- tabs ------------------------------- */
+function showTab(name) {
+  document.querySelectorAll("nav button").forEach((b) =>
+    b.classList.toggle("on", b.dataset.tab === name));
+  document.querySelectorAll("section").forEach((s) =>
+    s.classList.toggle("on", s.id === "tab-" + name));
+}
 document.querySelectorAll("nav button").forEach((b) => {
-  b.onclick = () => {
-    document.querySelectorAll("nav button").forEach((x) => x.classList.remove("on"));
-    document.querySelectorAll("section").forEach((x) => x.classList.remove("on"));
-    b.classList.add("on");
-    $("#tab-" + b.dataset.tab).classList.add("on");
-  };
+  b.onclick = () => showTab(b.dataset.tab);
 });
+showTab("api"); // default view -- otherwise every <section> stays hidden
 
 /* ------------------------------- renderers ------------------------------- */
 function renderTable(el, rows) {
@@ -281,17 +283,28 @@ function cards(el, obj) {
 
 /* ------------------------------- health ------------------------------- */
 async function init() {
+  let sources = ["api", "ble"];
   try {
     const h = await getJSON("/api/health");
+    sources = h.sources;
     const pills = [`<span class="pill">sources <b>${h.sources.join(" + ")}</b></span>`];
     if (h.databases.api) pills.push(`<span class="pill api">api <b>${esc(h.databases.api.split("/").pop())}</b></span>`);
     if (h.databases.ble) pills.push(`<span class="pill ble">ble <b>${esc(h.databases.ble.split("/").pop())}</b></span>`);
     $("#pills").innerHTML = pills.join("");
   } catch (e) { toast("health: " + e.message); }
 
-  await loadApi();
-  await loadBle();
-  await loadCross();
+  // Hide tabs for sources this server does not expose, then pick a default.
+  const both = sources.includes("api") && sources.includes("ble");
+  document.querySelectorAll("nav button").forEach((b) => {
+    const t = b.dataset.tab;
+    if ((t === "api" || t === "ble") && !sources.includes(t)) b.style.display = "none";
+    if (t === "cross" && !both) b.style.display = "none";
+  });
+  showTab(sources.includes("api") ? "api" : sources.includes("ble") ? "ble" : "cross");
+
+  if (sources.includes("api")) await loadApi();
+  if (sources.includes("ble")) await loadBle();
+  if (both) await loadCross();
 }
 
 /* ------------------------------- API tab ------------------------------- */
