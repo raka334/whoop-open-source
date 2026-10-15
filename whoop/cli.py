@@ -60,6 +60,77 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_all(args: argparse.Namespace) -> int:
+    """Pull the API and mine the strap at the same time, then reconcile."""
+    from . import sync as sync_mod
+
+    config, store = _config_and_store()
+    address = args.address or config.ble_address
+    resources = tuple(args.resources.split(",")) if args.resources else None
+    with store:
+        report = asyncio.run(
+            sync_mod.sync_all(
+                config,
+                store,
+                start=args.start,
+                end=args.end,
+                resources=resources,
+                api=not args.no_api,
+                ble=not args.no_ble,
+                address=address,
+                family=args.family,
+                seconds=args.seconds,
+                imu=args.imu,
+            )
+        )
+        print("== dual-source sync (concurrent) ==")
+        if report.api is not None:
+            for name, n in report.api.items():
+                print(f"  api.{name:14s} {n}")
+        if report.ble is not None:
+            print(
+                f"  ble.packets      {report.ble.get('packets')} "
+                f"(family={report.ble.get('family')}, "
+                f"{report.ble.get('subscribed')} notify chars)"
+            )
+        for name, err in report.errors.items():
+            print(f"  !! {name}: {err}")
+        print("coverage:")
+        _print_coverage(report.coverage)
+        _print_reconciliation(report.reconciliation)
+    return 0 if report.ok else 1
+
+
+def _print_coverage(coverage: dict[str, dict]) -> None:
+    for source, c in coverage.items():
+        window = f"{c.get('start') or '-':32s} .. {c.get('end') or '-'}"
+        print(f"  {source:8s} rows={c.get('rows', 0):<6d} {window}")
+
+
+def _print_reconciliation(rows: list[dict]) -> None:
+    if not rows:
+        print("reconciliation: no overlapping API windows yet (sync both sides first)")
+        return
+    print("reconciliation (API average HR vs BLE samples in the same window):")
+    for r in rows:
+        delta = r["delta"]
+        flag = "  <-- check" if delta is not None and abs(delta) >= 10 else ""
+        print(
+            f"  {r['kind']:8s} {str(r['id'])[:14]:14s} "
+            f"api_avg={r['api_avg']} ble_avg={r['ble_avg']} "
+            f"ble_n={r['ble_n']} delta={delta}{flag}"
+        )
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    config, store = _config_and_store()
+    with store:
+        print("coverage:")
+        _print_coverage(store.coverage())
+        _print_reconciliation(store.reconcile(start=args.start, end=args.end))
+    return 0
+
+
 def cmd_ble_scan(args: argparse.Namespace) -> int:
     from .ble import stream
 
@@ -263,6 +334,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--end", help="ISO datetime upper bound")
     p.add_argument("--resources", help="comma list: cycles,recoveries,sleeps,workouts")
     p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser(
+        "sync-all", help="pull the API and mine the strap concurrently, then reconcile"
+    )
+    p.add_argument("--start", help="ISO datetime lower bound")
+    p.add_argument("--end", help="ISO datetime upper bound")
+    p.add_argument("--resources", help="comma list: cycles,recoveries,sleeps,workouts")
+    p.add_argument("--address", help="BLE address (default: WHOOP_BLE_ADDRESS)")
+    p.add_argument("--family", choices=["whoop4", "whoop5"])
+    p.add_argument("--seconds", type=float, default=60.0, help="BLE capture duration")
+    p.add_argument("--imu", action="store_true", help="also arm the raw IMU producer")
+    p.add_argument("--no-api", action="store_true", help="skip the API half")
+    p.add_argument("--no-ble", action="store_true", help="skip the BLE half")
+    p.set_defaults(func=cmd_sync_all)
+
+    p = sub.add_parser("reconcile", help="compare API metrics against BLE data")
+    p.add_argument("--start", help="ISO datetime lower bound")
+    p.add_argument("--end", help="ISO datetime upper bound")
+    p.set_defaults(func=cmd_reconcile)
 
     p = sub.add_parser("ble-scan", help="scan for WHOOP straps over BLE")
     p.add_argument("--timeout", type=float, default=8.0)

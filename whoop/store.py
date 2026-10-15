@@ -167,6 +167,15 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _norm_ts(value: str | None) -> str | None:
+    """Canonicalize a timestamp so API ('…Z') and BLE ('…+00:00') compare equal."""
+    if value is None:
+        return None
+    if value.endswith("+00:00"):
+        return value[:-6] + "Z"
+    return value
+
+
 def _get(d: dict[str, Any], *path: str, default: Any = None) -> Any:
     """Safe nested lookup: `_get(rec, "score", "strain")`."""
     cur: Any = d
@@ -203,6 +212,18 @@ class Store:
             for name, decl in columns.items():
                 if name not in existing:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+        # Idempotent BLE HR ingestion: collapse any pre-existing duplicates, then
+        # enforce uniqueness so re-running a sync/backfill never double-counts.
+        self._conn.execute(
+            "DELETE FROM hr_samples WHERE id NOT IN ("
+            "  SELECT MIN(id) FROM hr_samples"
+            "  GROUP BY COALESCE(device_id, ''), ts, bpm)"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_samples_dedupe "
+            "ON hr_samples (COALESCE(device_id, ''), ts, bpm)"
+        )
 
     # ------------------------------- reads -------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -443,8 +464,8 @@ class Store:
     def add_hr_samples(self, samples: Iterable[dict[str, Any]]) -> int:
         rows = [
             (
-                s.get("device_id"),
-                s.get("ts"),
+                s.get("device_id") or "",
+                _norm_ts(s.get("ts")),
                 s.get("bpm"),
                 json.dumps(s["rr_ms"]) if s.get("rr_ms") is not None else None,
                 s.get("source", "ble"),
@@ -452,12 +473,14 @@ class Store:
             for s in samples
         ]
         with self._lock:
-            self._conn.executemany(
-                "INSERT INTO hr_samples (device_id, ts, bpm, rr_ms, source) VALUES (?, ?, ?, ?, ?)",
+            # INSERT OR IGNORE + the unique index make re-syncs idempotent.
+            cur = self._conn.executemany(
+                "INSERT OR IGNORE INTO hr_samples (device_id, ts, bpm, rr_ms, source) "
+                "VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
             self._conn.commit()
-        return len(rows)
+            return cur.rowcount if cur.rowcount is not None else len(rows)
 
     def add_raw_packet(self, packet: dict[str, Any]) -> None:
         with self._lock:
@@ -470,7 +493,7 @@ class Store:
                 """,
                 (
                     packet.get("device_id"),
-                    packet.get("ts"),
+                    _norm_ts(packet.get("ts")),
                     packet.get("channel"),
                     packet.get("char_uuid"),
                     packet.get("family"),
@@ -481,6 +504,79 @@ class Store:
                 ),
             )
             self._conn.commit()
+
+    # ---------------------------- reconciliation -------------------------
+    def hr_summary(self, start: str, end: str) -> dict[str, Any]:
+        """BLE HR stats over an inclusive [start, end] window."""
+        row = self.query_one(
+            "SELECT COUNT(*) AS n, AVG(bpm) AS avg_bpm, MIN(bpm) AS min_bpm, "
+            "MAX(bpm) AS max_bpm FROM hr_samples WHERE ts >= ? AND ts <= ?",
+            (_norm_ts(start), _norm_ts(end)),
+        )
+        return row or {"n": 0, "avg_bpm": None, "min_bpm": None, "max_bpm": None}
+
+    def coverage(self) -> dict[str, dict[str, Any]]:
+        """What window each source actually covers, computed from stored data."""
+        api = self.query_one(
+            "SELECT MIN(lo) AS lo, MAX(hi) AS hi FROM ("
+            "  SELECT MIN(start) AS lo, MAX(end) AS hi FROM cycles"
+            "  UNION ALL SELECT MIN(start), MAX(end) FROM sleeps"
+            "  UNION ALL SELECT MIN(start), MAX(end) FROM workouts)"
+        ) or {}
+        api_rows = sum(
+            self.query_one(f"SELECT COUNT(*) AS n FROM {t}")["n"]
+            for t in ("cycles", "recoveries", "sleeps", "workouts")
+        )
+        hr = self.query_one(
+            "SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM hr_samples"
+        ) or {}
+        raw = self.query_one(
+            "SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM raw_packets"
+        ) or {}
+        return {
+            "api": {"start": _norm_ts(api.get("lo")), "end": _norm_ts(api.get("hi")), "rows": api_rows},
+            "ble_hr": {"start": hr.get("lo"), "end": hr.get("hi"), "rows": hr.get("n") or 0},
+            "ble_raw": {"start": raw.get("lo"), "end": raw.get("hi"), "rows": raw.get("n") or 0},
+        }
+
+    def reconcile(self, *, start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
+        """Compare each API cycle/workout HR against BLE samples in the same window.
+
+        The two sources are complementary, not duplicates -- but where they overlap
+        the high-rate BLE stream should corroborate the API's averaged HR. A large
+        delta is the signal that something is off (wrong device/day, or a gap).
+        """
+        out: list[dict[str, Any]] = []
+        for kind, table in (("cycle", "cycles"), ("workout", "workouts")):
+            for r in self.query(
+                f"SELECT * FROM {table} WHERE start IS NOT NULL AND end IS NOT NULL"
+            ):
+                if start and _norm_ts(r["end"]) < _norm_ts(start):
+                    continue
+                if end and _norm_ts(r["start"]) > _norm_ts(end):
+                    continue
+                s = self.hr_summary(r["start"], r["end"])
+                api_avg = r.get("average_heart_rate")
+                ble_avg = round(s["avg_bpm"], 1) if s.get("avg_bpm") is not None else None
+                out.append(
+                    {
+                        "kind": kind,
+                        "id": r["id"],
+                        "start": r["start"],
+                        "end": r["end"],
+                        "api_avg": api_avg,
+                        "api_max": r.get("max_heart_rate"),
+                        "ble_n": s.get("n") or 0,
+                        "ble_avg": ble_avg,
+                        "ble_max": s.get("max_bpm"),
+                        "delta": (
+                            round(ble_avg - api_avg, 1)
+                            if ble_avg is not None and api_avg is not None
+                            else None
+                        ),
+                    }
+                )
+        return out
 
     # ------------------------------ capture ------------------------------
     def start_capture(

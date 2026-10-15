@@ -35,6 +35,7 @@ Use the API for reliable daily metrics and the BLE path for raw/real-time data.
 whoop/
 ├── config.py             env/.env configuration
 ├── store.py              unified SQLite schema + upserts (the shared seam)
+├── sync.py               concurrent dual-source sync + coverage/reconciliation
 ├── api/                  official Developer API v2
 │   ├── oauth.py          authorization-code flow + refresh
 │   ├── client.py         authenticated GET + pagination
@@ -72,6 +73,43 @@ whoop sync --start 2026-01-01T00:00:00Z --resources recovery,sleeps
 ```
 
 Tokens auto-refresh on expiry. Collection endpoints paginate automatically.
+
+### Sync both sources at once
+
+```bash
+whoop sync-all                       # API pull + BLE mine, concurrently
+whoop sync-all --seconds 120 --imu   # longer BLE window, also arm raw motion
+whoop sync-all --no-ble              # API only (e.g. strap not nearby)
+whoop reconcile                      # cross-check API metrics vs BLE data
+```
+
+`sync-all` runs the API pull on a worker thread and the BLE capture on the event
+loop **at the same time**, into the one store. The store serializes writes with a
+single lock, so neither source blocks the other and a failure in one never rolls
+back the other — you get a per-source report instead of an all-or-nothing result:
+
+```
+== dual-source sync (concurrent) ==
+  api.cycles         1
+  api.sleeps         1
+  ble.packets      412 (family=whoop5, 3 notify chars)
+coverage:
+  api      rows=2   2026-01-01T00:00:00.000Z   .. 2026-01-02T00:00:00.000Z
+  ble_hr   rows=8640 2026-01-01T00:00:00.000Z  .. 2026-01-01T12:00:00.000Z
+reconciliation (API average HR vs BLE samples in the same window):
+  cycle  1  api_avg=58 ble_avg=58.0 ble_n=120 delta=0.0
+```
+
+- **BLE re-syncs are idempotent** — HR samples are deduped on
+  `(device, timestamp, bpm)`, so running `sync-all` twice never double-counts.
+- **Coverage** shows the window each side actually holds, so you can see gaps.
+- **Reconciliation** compares each API cycle/workout average HR against the BLE
+  samples in the same window. The two sources are *complementary, not duplicates*;
+  their overlap is a cross-check, and a big delta means something's off (wrong
+  device/day, or a gap). Timestamps are canonicalized (`…Z`) so both sides compare.
+
+Neither source replaces the other: the **API** gives WHOOP's computed daily
+metrics, the **BLE** path gives raw high-rate data. Sync both.
 
 ### BLE (raw path)
 
@@ -216,8 +254,9 @@ Not medical advice.
 - [x] Raw capture: full GATT enum + every notify char + `char_uuid` provenance
 - [x] Command write-safety classification (unknown opcodes blocked)
 - [x] NDJSON/CSV export of every table
+- [x] Concurrent dual-source sync (`sync-all`) + coverage/reconciliation
+- [ ] BLE history offload loop (durable-commit-then-ACK, replay-safe)
 - [ ] HCI-log ingest (iOS `.pklg` / Android `btsnoop`) -> frame store
 - [ ] Ground-truth correlator against the official CSV export
 - [ ] Decode the remaining 5/MG records (R18/R20/R22/R26) against a real capture
 - [ ] Webhook receiver for API push updates
-- [ ] Backfill BLE history (`0x16`/`0x17`) into the store
