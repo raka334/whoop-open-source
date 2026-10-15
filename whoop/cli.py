@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 from .config import Config
 from .store import Store
@@ -106,37 +107,123 @@ def cmd_ble_probe(args: argparse.Namespace) -> int:
         count = asyncio.run(
             stream.probe_proprietary(
                 address,
+                family=args.family,
                 seconds=args.seconds,
                 store=store,
                 device_id=config.device_id or address,
                 handshake=not args.no_handshake,
+                allow_side_effect=args.allow_side_effect,
             )
         )
     print(f"\nCaptured {count} proprietary packets.")
     if count == 0:
         print(
-            "No packets. On macOS the fd4b channel needs a bonded/encrypted link;\n"
+            "No packets. On macOS the vendor channel needs a bonded/encrypted link;\n"
             "try Linux (BlueZ) or the iOS path in ryanbr/noop for raw capture."
         )
     return 0
 
 
+def cmd_capture(args: argparse.Namespace) -> int:
+    """Enumerate full GATT, subscribe every notify char, log raw frames."""
+    from .ble import stream
+
+    config, store = _config_and_store()
+    address = args.address or config.ble_address
+    if not address:
+        raise SystemExit("No address. Pass --address or set WHOOP_BLE_ADDRESS.")
+    with store:
+        summary = asyncio.run(
+            stream.capture(
+                address,
+                family=args.family,
+                seconds=args.seconds,
+                store=store,
+                device_id=config.device_id or address,
+                imu=args.imu,
+                note=args.note,
+                quiet=args.quiet,
+            )
+        )
+    print(
+        f"\nCaptured {summary['packets']} raw frames "
+        f"(family={summary['family']}, {summary['subscribed']} notifiable characteristics)"
+    )
+    print(f"  session_id={summary['session_id']}  db={store.path}")
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Dump every stored row as NDJSON or CSV, so nothing stays locked in."""
+    import csv
+    import io
+
+    config, store = _config_and_store()
+    tables = [args.table] if args.table else list(Store.TABLES)
+    fmt = args.format
+    with store:
+        for table in tables:
+            rows = store.export_rows(table)
+            if args.dest:
+                path = Path(args.dest) / f"{table}.{ 'csv' if fmt == 'csv' else 'ndjson'}"
+                out = path.open("w", encoding="utf-8")
+                close = True
+            else:
+                out = io.StringIO() if fmt == "csv" else sys.stdout
+                close = fmt == "csv"
+            try:
+                if fmt == "csv":
+                    fieldnames = list(rows[0].keys()) if rows else []
+                    writer = csv.DictWriter(out, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                else:
+                    for row in rows:
+                        out.write(json.dumps(row, separators=(",", ":")) + "\n")
+            finally:
+                if close:
+                    out.close()
+            if args.dest:
+                print(f"{table:18s} {len(rows):>6d} rows -> {path}")
+            elif fmt == "csv":
+                sys.stdout.write(out.getvalue())
+    return 0
+
+
+def cmd_retention(args: argparse.Namespace) -> int:
+    print(
+        "WHOOP on-device retention\n"
+        "  - The strap keeps up to ~14 days of data locally (WHOOP support docs).\n"
+        "    One community post claims 30 days; treat 14 as the safe figure.\n"
+        "  - It resumes syncing automatically when your phone is reachable; a full\n"
+        "    14-day catch-up can take up to ~1 hour.\n"
+        "  - The durable store is the type-47 historical record, served from a\n"
+        "    page-slot ring buffer (the bounds come back from GET_DATA_RANGE).\n"
+        "  - There is NO GPS on the strap: WHOOP 5/MG has no GNSS chip. Any\n"
+        "    distance/altitude in the official API is phone- or health-derived.\n"
+    )
+    return 0
+
+
 def cmd_frames(args: argparse.Namespace) -> int:
-    """Decode space/hex-packed frames, or rebuild one to sanity-check."""
+    """Decode space/hex-packed frames (auto-detecting family), or rebuild one."""
     if args.build:
         pt, seq, cmd = args.build
-        frame = P.build_frame(int(pt, 0), int(seq, 0), int(cmd, 0))
-        print(f"built: {frame.hex()}")
+        family = args.family or "whoop5"
+        body = bytes.fromhex(args.body.replace(" ", "")) if args.body else b""
+        frame = P.build_frame(family, int(pt, 0), int(seq, 0), int(cmd, 0), body)
+        print(f"built ({family}): {frame.hex()}")
         return 0
     for token in args.hex:
         buf = bytes.fromhex(token.replace(" ", ""))
-        frame = P.parse_frame(buf)
+        frame = P.parse_frame(buf, family=args.family or None)
         if frame is None:
             print(f"{token}: not a valid frame")
             continue
         print(
             json.dumps(
                 {
+                    "family": frame.family.value,
                     "name": frame.name,
                     "valid_crc": frame.valid_crc,
                     "packet_type": hex(frame.packet_type),
@@ -187,21 +274,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seconds", type=float, default=60.0)
     p.set_defaults(func=cmd_ble_hr)
 
-    p = sub.add_parser("ble-probe", help="capture proprietary fd4b packets")
+    p = sub.add_parser("ble-probe", help="capture proprietary vendor-channel packets")
     p.add_argument("--address")
+    p.add_argument("--family", choices=["whoop4", "whoop5"], default="whoop5")
     p.add_argument("--seconds", type=float, default=30.0)
     p.add_argument("--no-handshake", action="store_true")
+    p.add_argument("--allow-side-effect", action="store_true")
     p.set_defaults(func=cmd_ble_probe)
+
+    p = sub.add_parser(
+        "capture", help="enumerate full GATT and log every raw frame (with char_uuid)"
+    )
+    p.add_argument("--address")
+    p.add_argument("--family", choices=["whoop4", "whoop5"])
+    p.add_argument("--seconds", type=float, default=60.0)
+    p.add_argument("--imu", action="store_true", help="arm the 100 Hz raw IMU producer")
+    p.add_argument("--note", help="free-form label stored with the capture session")
+    p.add_argument("--quiet", action="store_true", help="do not print each frame")
+    p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("export", help="dump every stored row as NDJSON or CSV")
+    p.add_argument("--table", help="single table (default: all)")
+    p.add_argument("--format", choices=["ndjson", "csv"], default="ndjson")
+    p.add_argument("--dest", help="output directory (default: stdout)")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("retention", help="explain WHOOP on-device data retention")
+    p.set_defaults(func=cmd_retention)
 
     p = sub.add_parser("frames", help="decode or build protocol frames")
     p.add_argument("hex", nargs="*", help="hex frame(s) to decode")
+    p.add_argument(
+        "--family",
+        choices=["whoop4", "whoop5"],
+        help="force a family (decode auto-detects; build defaults to whoop5)",
+    )
     p.add_argument(
         "--build",
         nargs=3,
         metavar=("PACKET_TYPE", "SEQ", "CMD"),
         help="build a frame from components (decimal or 0x-hex)",
     )
-    p.set_defaults(func=cmd_frames)
+    p.add_argument("--body", help="hex body appended when building")
+    p.set_defaults(func=cmd_frames, family=None)
 
     p = sub.add_parser("stats", help="show row counts in the local store")
     p.set_defaults(func=cmd_stats)

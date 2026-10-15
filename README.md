@@ -1,7 +1,8 @@
 # whoop-open-source
 
-A unified WHOOP 5.0 data pipeline: pull **processed metrics from the official API** *and*
-**raw sensor data straight off the strap over BLE**, and land both in one local SQLite store.
+A unified WHOOP data pipeline (4.0 and 5.0/MG): pull **processed metrics from the
+official API** *and* **raw sensor data straight off the strap over BLE**, and land
+both in one local SQLite store.
 
 ```
                   ┌───────────────────────┐
@@ -39,8 +40,9 @@ whoop/
 │   ├── client.py         authenticated GET + pagination
 │   └── sync.py           pull collections into the store
 ├── ble/                  reverse-engineered strap protocol
-│   ├── protocol.py       framing, CRCs, commands, HR parsing
-│   └── stream.py         scan / HR stream / proprietary probe (bleak)
+│   ├── protocol.py       family-aware framing (WHOOP 4 + 5/MG), CRCs, commands, safety
+│   ├── sensors.py        WHOOP 5/MG decoders (packet 40 live HR, R21 IMU burst)
+│   └── stream.py         scan / HR stream / probe / full raw capture (bleak)
 └── cli.py                command-line entry point
 ```
 
@@ -75,60 +77,118 @@ Tokens auto-refresh on expiry. Collection endpoints paginate automatically.
 
 ```bash
 whoop ble-scan                 # find the strap, copy the address into .env
-whoop ble-hr --seconds 120     # live HR + R-R intervals -> hr_samples
-whoop ble-probe --seconds 30   # dump proprietary fd4b packets -> raw_packets
+whoop ble-hr --seconds 120     # live HR + R-R intervals -> hr_samples (works on macOS)
+whoop ble-probe --seconds 30   # vendor handshake + dump those channels -> raw_packets
+whoop capture --seconds 120 --imu   # full GATT enum + every notify char -> raw_packets
 whoop stats                    # row counts for everything
+whoop retention                # what the strap keeps on-device, and the GPS caveat
+```
+
+`capture` enumerates the whole GATT tree, subscribes to **every** notifiable
+characteristic, and stores each frame with its `char_uuid` and detected family —
+nothing is decoded away. `--imu` also arms the 100 Hz raw-motion producer.
+
+### Export everything
+
+```bash
+whoop export                              # every table as NDJSON to stdout
+whoop export --format csv --dest ./dump   # one CSV per table on disk
+whoop export --table raw_packets           # just the raw frames
 ```
 
 ### Protocol debugging
 
 ```bash
-# decode a captured frame
-whoop frames "aa100057 230423aa8ed469a96d0000005130fef3"
-# {"name": "command:HELLO", "valid_crc": true, ...}
+# decode a captured frame (family auto-detected)
+whoop frames "aa100057230423aa8ed469a96d0000005130fef3"
+# {"family": "whoop4", "name": "command:HELLO_HARVARD", ...}
 
-# build one to compare against a capture
-whoop frames --build 0x23 4 0x23
+# rebuild the real WHOOP 5 connect hello, byte-for-byte
+whoop frames --build 35 1 145 --family whoop5 --body 01
+# aa0108000001e67123019101363e5c8d
 ```
 
-## Protocol notes (WHOOP 5.0 / MG)
+## Protocol notes (WHOOP 4 **and** WHOOP 5/MG)
 
-The proprietary protocol is partially documented in the community; these rules are
-**verified against a real captured frame** in `tests/test_protocol.py`.
+WHOOP uses **two different on-the-wire envelopes**. They share a command-number
+vocabulary and a CRC32 trailer, but the headers are incompatible — a WHOOP 5
+frame is *not* a WHOOP 4 frame with shifted offsets. Select the family before
+parsing (`whoop/ble/protocol.py`).
 
-**Framing**
+**WHOOP 4 ("Harvard")** — service `61080001-…`
 
 ```
-+----+--------+-------+---------------------------+----------+
-| AA | LEN LE | CRC8  | payload                   | CRC32 LE |
-+----+--------+-------+---------------------------+----------+
-  1B    2B      1B      LEN - 4 bytes               4B
++----+--------+-------+--------------------------+----------+
+| AA | LEN LE | CRC8  | type|seq|cmd|data        | CRC32 LE |
++----+--------+-------+--------------------------+----------+
+  1B    2B      1B      LEN - 4 bytes                4B
 ```
 
-- `LEN = len(payload) + 4`, where `payload = packet_type | seq | cmd | data`.
-- **CRC8** (poly `0x07`, init `0x00`) is computed over the **two LEN bytes only**.
-- **CRC32** is `zlib.crc32(payload)`, little-endian.
+- `LEN = len(inner) + 4`, `inner = type|seq|cmd|data`.
+- **CRC8** (poly `0x07`, init `0x00`) over the **two LEN bytes only**.
+- **CRC32** is `zlib.crc32(inner)`, little-endian.
 
-**Packet types:** `0x23` command (app→strap), `0x24` response, `0x28` data, `0x30` event.
-(The `0x72`/`0x73` in older write-ups are wrong.)
+**WHOOP 5 / MG ("puffin")** — service `fd4b0001-…`
 
-**GATT:** WHOOP 5.0/MG use service base `fd4b0001-…`; WHOOP 4.0 uses `61080001-…`.
-Characteristics: `0002` write, `0003` response, `0004` event, `0005` data, `0007` memfault.
+```
++----+----+--------+-------+--------+-----------------+----------+
+| AA | 01 | LEN LE | FIELD | CRC16  | inner (4-pad)   | CRC32 LE |
++----+----+--------+-------+--------+-----------------+----------+
+  1B   1B    2B       2B      2B      LEN - 4 bytes       4B
+```
 
-**Handshake:** HELLO (`0x23`) → clock sync (`0x0A`) → feature flags (`0x75/0x76/0x78`) →
-config (`0x22`) → historical data (`0x16/0x17`). `RT_HR_ON` (`0x03`) starts live HR;
-`0x0E` enables the standard `0x2A37` broadcast.
+- `FIELD` = `00 01` requests / `01 00` responses.
+- `LEN = len(padded inner) + 4`; **total frame = LEN + 8**.
+- **CRC16-Modbus** (reflected poly `0xA001`, init `0xFFFF`) over bytes `[0, 6)`.
+- `inner = type|seq|cmd|body`, zero-padded to a multiple of 4.
+- **CRC32** over the padded inner, little-endian.
+
+Packet types: `0x23` command (app→strap), `0x24` response, `0x28` data / live HR,
+`0x2B` realtime, `0x2F` historical, `0x30` event.
+
+**GATT channels:** WHOOP 5/MG `fd4b0002` write, `0003` response, `0004` event,
+`0005` data, `0007` memfault; WHOOP 4 uses `61080002…0005`.
+
+**Handshake:** WHOOP 5 uses the fixed `CLIENT_HELLO`
+(`aa 01 08 00 00 01 e6 71 23 01 91 01 36 3e 5c 8d`, cmd `0x91`); WHOOP 4 uses
+`HELLO_HARVARD` (`0x23`). Then data range (`0x22`), config (`0x78`), historical
+(`0x16`/`0x17`). `RT_HR_ON` (`0x03`) starts live HR; `0x0E` wakes the standard
+`0x2A37` broadcast. Raw 100 Hz motion = `START_RAW_DATA` (`0x51`) then
+`TOGGLE_IMU_MODE` (`0x6A`, payload `[0x01, 0x01]`); stop = `0x52` then `0x6A`
+`[0x01, 0x00]`.
+
+**Write safety:** `assert_writable()` allows known-benign opcodes, gates known
+side-effect opcodes (e.g. `0x42` is `SET_ALARM_TIME` on 5.0 — it makes the strap
+buzz, it is *not* `SET_CLOCK`), and **refuses unknown opcodes** by default. We do
+not invent numbers for destructive operations (firmware load, force-trim, ship
+mode, fuel-gauge reset); anything not listed is blocked.
 
 Standard BLE: HR `0x180D`/`0x2A37`, Battery `0x180F`/`0x2A19`, Device Info `0x180A`.
-The HR service is **dormant** until the proprietary channel wakes it, and only emits after
-the strap has been enrolled once in the official app.
+The HR service is **dormant** until the vendor channel wakes it, and only emits
+after the strap has been enrolled once in the official app.
+
+### Data retention & the GPS myth
+
+- The strap keeps **up to ~14 days** of data on-device and resumes syncing when
+  your phone is reachable; a full 14-day catch-up can take up to ~1 hour.
+  (One community post claims 30 days — WHOOP's own support docs say 14.)
+- The durable store is the **type-47 historical record**, served from a page-slot
+  ring buffer whose bounds come back from `GET_DATA_RANGE` (`0x22`).
+- **WHOOP 5/MG has no GPS.** There is no GNSS chip and no GPS track on the strap.
+  The only location-adjacent data is what the official API derives for a workout
+  (`distance_meter`, `altitude_gain_meter`, `altitude_change_meter`), usually from
+  the paired phone. Any claim of "GPS from the band" is a misunderstanding.
+- Even a full raw capture does **not** recover everything: SpO2 is not recoverable
+  offline from the time-multiplexed PPG stream, skin temperature is inconsistent,
+  and sleep stages / overnight HRV need enough R-R coverage. Honesty beats hype.
 
 ### Platform gotcha
 
-The `fd4b` channel requires a **bonded/encrypted** link. On macOS, Python/`bleak` gets
-`Encryption is insufficient` after app-pairing, so `ble-probe` often returns zero packets
-there. The proven-on-macOS path is **`ble-hr`** (standard `0x2A37`). For full proprietary
-capture, run on Linux (BlueZ, which can bond) or use the iOS CoreBluetooth projects below.
+The vendor channel requires a **bonded/encrypted** link. On macOS, Python/`bleak`
+gets `Encryption is insufficient` after app-pairing, so `ble-probe`/`capture`
+often return zero packets there. The proven-on-macOS path is **`ble-hr`**
+(standard `0x2A37`). For full vendor capture, run on Linux (BlueZ, which can bond)
+or use the iOS CoreBluetooth projects below.
 
 ## Prior art / credits
 
@@ -152,8 +212,12 @@ Not medical advice.
 
 ## Roadmap
 
+- [x] Family-aware protocol split (WHOOP 4 + 5/MG) with real-frame anchors
+- [x] Raw capture: full GATT enum + every notify char + `char_uuid` provenance
+- [x] Command write-safety classification (unknown opcodes blocked)
+- [x] NDJSON/CSV export of every table
+- [ ] HCI-log ingest (iOS `.pklg` / Android `btsnoop`) -> frame store
+- [ ] Ground-truth correlator against the official CSV export
+- [ ] Decode the remaining 5/MG records (R18/R20/R22/R26) against a real capture
 - [ ] Webhook receiver for API push updates
-- [ ] Decode the 93-byte historical sensor record (SpO2, skin temp, motion)
-- [ ] Interval-level API endpoints (`/cycle/{id}/recovery`, `/sleep/{id}`)
-- [ ] CSV/Parquet export from the unified store
 - [ ] Backfill BLE history (`0x16`/`0x17`) into the store

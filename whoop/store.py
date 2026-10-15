@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,7 +103,11 @@ CREATE TABLE IF NOT EXISTS workouts (
     average_heart_rate INTEGER,
     max_heart_rate    INTEGER,
     kilojoule         REAL,
+    -- WHOOP 5/MG has NO GPS chip. The only location-like data is what the
+    -- official API derives (usually from the paired phone), and it is coarse.
     distance_meter    REAL,
+    altitude_gain_meter   REAL,
+    altitude_change_meter REAL,
     raw_json          TEXT,
     fetched_at        TEXT
 );
@@ -123,13 +128,39 @@ CREATE TABLE IF NOT EXISTS raw_packets (
     device_id    TEXT,
     ts           TEXT,
     channel      TEXT,
+    char_uuid    TEXT,
+    family       TEXT,
     packet_type  INTEGER,
     command      INTEGER,
     hex          TEXT,
     decoded_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_raw_packets_ts ON raw_packets (device_id, ts);
+
+-- One row per capture session, so a raw dump is reproducible/attributable.
+CREATE TABLE IF NOT EXISTS capture_sessions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id    TEXT,
+    family       TEXT,
+    address      TEXT,
+    started_at   TEXT,
+    ended_at     TEXT,
+    note         TEXT,
+    packet_count INTEGER DEFAULT 0
+);
 """
+
+# Columns added after the initial schema; applied to pre-existing databases.
+_MIGRATIONS = {
+    "raw_packets": {
+        "char_uuid": "TEXT",
+        "family": "TEXT",
+    },
+    "workouts": {
+        "altitude_gain_meter": "REAL",
+        "altitude_change_meter": "REAL",
+    },
+}
 
 
 def _utcnow() -> str:
@@ -153,10 +184,35 @@ class Store:
     def __post_init__(self) -> None:
         self.path = Path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path)
+        # check_same_thread=False + a lock lets the threaded web server share one
+        # connection safely while the CLI stays effectively single-threaded.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema (idempotent)."""
+        for table, columns in _MIGRATIONS.items():
+            existing = {
+                row["name"]
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    # ------------------------------- reads -------------------------------
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def query_one(self, sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
+        rows = self.query(sql, params)
+        return rows[0] if rows else None
 
     # ----------------------------- lifecycle -----------------------------
     def close(self) -> None:
@@ -177,7 +233,8 @@ class Store:
                 datetime.now(timezone.utc).timestamp() + int(payload["expires_in"]),
                 tz=timezone.utc,
             ).isoformat(timespec="seconds")
-        self._conn.execute(
+        with self._lock:
+            self._conn.execute(
             """
             INSERT INTO oauth_tokens
                 (provider, access_token, refresh_token, token_type, scope, expires_at, user_id, updated_at)
@@ -200,13 +257,14 @@ class Store:
                 "user_id": payload.get("user_id"),
                 "updated_at": _utcnow(),
             },
-        )
-        self._conn.commit()
+            )
+            self._conn.commit()
 
     def load_tokens(self, provider: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM oauth_tokens WHERE provider = ?", (provider,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM oauth_tokens WHERE provider = ?", (provider,)
+            ).fetchone()
         if row is None:
             return None
         data = dict(row)
@@ -217,23 +275,25 @@ class Store:
 
     # ------------------------------- cursors -----------------------------
     def set_cursor(self, source: str, resource: str, cursor: str | None) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO source_sync (source, resource, cursor, last_synced_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(source, resource) DO UPDATE SET
-                cursor = excluded.cursor,
-                last_synced_at = excluded.last_synced_at
-            """,
-            (source, resource, cursor, _utcnow()),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO source_sync (source, resource, cursor, last_synced_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(source, resource) DO UPDATE SET
+                    cursor = excluded.cursor,
+                    last_synced_at = excluded.last_synced_at
+                """,
+                (source, resource, cursor, _utcnow()),
+            )
+            self._conn.commit()
 
     def get_cursor(self, source: str, resource: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT cursor FROM source_sync WHERE source = ? AND resource = ?",
-            (source, resource),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cursor FROM source_sync WHERE source = ? AND resource = ?",
+                (source, resource),
+            ).fetchone()
         return row["cursor"] if row else None
 
     # --------------------------- API upserts -----------------------------
@@ -344,6 +404,8 @@ class Store:
                 "max_heart_rate": _get(r, "score", "max_heart_rate"),
                 "kilojoule": _get(r, "score", "kilojoule"),
                 "distance_meter": _get(r, "score", "distance_meter"),
+                "altitude_gain_meter": _get(r, "score", "altitude_gain_meter"),
+                "altitude_change_meter": _get(r, "score", "altitude_change_meter"),
                 "raw_json": json.dumps(r, separators=(",", ":")),
                 "fetched_at": _utcnow(),
             }
@@ -355,7 +417,8 @@ class Store:
             cols=[
                 "id", "user_id", "start", "end", "sport_name", "score_state",
                 "strain", "average_heart_rate", "max_heart_rate", "kilojoule",
-                "distance_meter", "raw_json", "fetched_at",
+                "distance_meter", "altitude_gain_meter", "altitude_change_meter",
+                "raw_json", "fetched_at",
             ],
             conflict="id",
         )
@@ -371,8 +434,9 @@ class Store:
             f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
             f"ON CONFLICT({conflict}) DO UPDATE SET {updates}"
         )
-        self._conn.executemany(sql, rows)
-        self._conn.commit()
+        with self._lock:
+            self._conn.executemany(sql, rows)
+            self._conn.commit()
         return len(rows)
 
     # ------------------------------ BLE writes ---------------------------
@@ -387,36 +451,85 @@ class Store:
             )
             for s in samples
         ]
-        self._conn.executemany(
-            "INSERT INTO hr_samples (device_id, ts, bpm, rr_ms, source) VALUES (?, ?, ?, ?, ?)",
-            rows,
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO hr_samples (device_id, ts, bpm, rr_ms, source) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
         return len(rows)
 
     def add_raw_packet(self, packet: dict[str, Any]) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO raw_packets
-                (device_id, ts, channel, packet_type, command, hex, decoded_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                packet.get("device_id"),
-                packet.get("ts"),
-                packet.get("channel"),
-                packet.get("packet_type"),
-                packet.get("command"),
-                packet.get("hex"),
-                json.dumps(packet["decoded"]) if packet.get("decoded") is not None else None,
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO raw_packets
+                    (device_id, ts, channel, char_uuid, family,
+                     packet_type, command, hex, decoded_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    packet.get("device_id"),
+                    packet.get("ts"),
+                    packet.get("channel"),
+                    packet.get("char_uuid"),
+                    packet.get("family"),
+                    packet.get("packet_type"),
+                    packet.get("command"),
+                    packet.get("hex"),
+                    json.dumps(packet["decoded"]) if packet.get("decoded") is not None else None,
+                ),
+            )
+            self._conn.commit()
+
+    # ------------------------------ capture ------------------------------
+    def start_capture(
+        self, *, device_id: str, family: str, address: str, note: str | None = None
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO capture_sessions
+                    (device_id, family, address, started_at, note)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (device_id, family, address, _utcnow(), note),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def finish_capture(self, session_id: int, packet_count: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE capture_sessions SET ended_at = ?, packet_count = ? WHERE id = ?",
+                (_utcnow(), packet_count, session_id),
+            )
+            self._conn.commit()
 
     # -------------------------------- stats ------------------------------
+    TABLES = (
+        "cycles",
+        "recoveries",
+        "sleeps",
+        "workouts",
+        "hr_samples",
+        "raw_packets",
+        "capture_sessions",
+    )
+
     def stats(self) -> dict[str, int]:
-        tables = ("cycles", "recoveries", "sleeps", "workouts", "hr_samples", "raw_packets")
-        return {
-            t: self._conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
-            for t in tables
-        }
+        with self._lock:
+            return {
+                t: self._conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+                for t in self.TABLES
+            }
+
+    # ------------------------------- export ------------------------------
+    def export_rows(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return every column of every row in ``table`` (for NDJSON/CSV dumps)."""
+        if table not in self.TABLES:
+            raise ValueError(f"unknown table: {table}")
+        sql = f"SELECT * FROM {table}"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return self.query(sql)
