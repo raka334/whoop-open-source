@@ -26,7 +26,8 @@ class Config:
     client_secret: str
     redirect_uri: str
     scopes: tuple[str, ...]
-    db_path: Path
+    api_db_path: Path
+    ble_db_path: Path
     ble_address: str
     device_id: str
 
@@ -42,9 +43,14 @@ class Config:
                 "read:profile read:body_measurement",
             ).split()
         )
-        db_path = Path(os.environ.get("WHOOP_DB_PATH", "data/whoop.sqlite"))
-        if not db_path.is_absolute():
-            db_path = root / db_path
+
+        def _resolve(var: str, default: str) -> Path:
+            path = Path(os.environ.get(var, default))
+            return path if path.is_absolute() else root / path
+
+        # The two sources live in separate files; see whoop/store.py.
+        api_db_path = _resolve("WHOOP_API_DB_PATH", "data/whoop_api.sqlite")
+        ble_db_path = _resolve("WHOOP_BLE_DB_PATH", "data/whoop_ble.sqlite")
 
         return cls(
             client_id=os.environ.get("WHOOP_CLIENT_ID", ""),
@@ -53,7 +59,8 @@ class Config:
                 "WHOOP_REDIRECT_URI", "http://localhost:8721/callback"
             ),
             scopes=scopes,
-            db_path=db_path,
+            api_db_path=api_db_path,
+            ble_db_path=ble_db_path,
             ble_address=os.environ.get("WHOOP_BLE_ADDRESS", ""),
             device_id=os.environ.get("WHOOP_DEVICE_ID", ""),
         )

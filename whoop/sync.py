@@ -1,20 +1,15 @@
-"""Concurrent dual-source sync.
+"""Concurrent dual-source sync across the two separate databases.
 
-Pull the official API **and** mine the strap over BLE **at the same time**, into
-the same local store, then report coverage on both sides and reconcile where they
-overlap.
+Pull the official API **and** mine the strap over BLE **at the same time** -- but
+into their own stores, never into one shared file:
+
+* API records -> :class:`~whoop.store.ApiStore` (``data/whoop_api.sqlite``)
+* BLE records -> :class:`~whoop.store.BleStore` (``data/whoop_ble.sqlite``)
 
 Why concurrent is safe here: the two sources are independent (different
-transports, different rate) and the :class:`~whoop.store.Store` serializes writes
-with one re-entrant lock over a single SQLite connection. So neither source
-blocks the other, and a failure in one never corrupts or rolls back the other.
-
-Neither source *replaces* the other:
-
-* the **API** gives WHOOP's computed daily metrics (recovery, sleep, strain);
-* the **BLE** path gives raw, high-rate data (HR/R-R, motion, raw frames).
-
-Their overlap is a cross-check, which is what :meth:`Store.reconcile` reports.
+transports, different files) and each store serializes its own writes with a
+re-entrant lock. Neither source blocks the other, and a failure in one never
+touches the other's database.
 """
 
 from __future__ import annotations
@@ -25,7 +20,8 @@ from typing import Any, Awaitable, Callable
 
 from .api import sync as api_sync
 from .config import Config
-from .store import Store
+from .reconcile import Combined
+from .store import ApiStore, BleStore
 
 
 @dataclass
@@ -37,6 +33,7 @@ class JobResult:
 
 async def _run_sync(fn: Callable[[], Any]) -> JobResult:
     """Run a blocking callable off the event loop, capturing every failure."""
+
     def guarded() -> JobResult:
         try:
             return JobResult(ok=True, data=fn())
@@ -68,7 +65,8 @@ class SyncReport:
 
 async def sync_all(
     config: Config,
-    store: Store,
+    api_store: ApiStore,
+    ble_store: BleStore,
     *,
     start: str | None = None,
     end: str | None = None,
@@ -82,16 +80,12 @@ async def sync_all(
     api_fn: Callable[[], Any] | None = None,
     ble_fn: Callable[[], Awaitable[Any]] | None = None,
 ) -> SyncReport:
-    """Run the API pull and the BLE mine concurrently, then reconcile.
-
-    ``api_fn`` / ``ble_fn`` exist so the coordinator can be tested without a
-    network or a strap; production callers omit them.
-    """
+    """Run the API pull and the BLE mine concurrently, then reconcile read-only."""
     jobs: dict[str, asyncio.Future] = {}
 
     if api:
         call = api_fn or (
-            lambda: api_sync.sync(config, store, start=start, end=end, resources=resources)
+            lambda: api_sync.sync(config, api_store, start=start, end=end, resources=resources)
         )
         jobs["api"] = asyncio.create_task(_run_sync(call))
 
@@ -104,7 +98,7 @@ async def sync_all(
             )
         else:
             jobs["ble"] = asyncio.create_task(
-                _run_async(_ble_capture(store, address, config, family, seconds, imu))
+                _run_async(_ble_capture(ble_store, address, config, family, seconds, imu))
             )
 
     report = SyncReport()
@@ -117,9 +111,9 @@ async def sync_all(
         else:
             report.ble = result.data
 
-    # A shared DB is only useful if we can say what each side now covers.
-    report.coverage = store.coverage()
-    report.reconciliation = store.reconcile(start=start, end=end)
+    combined = Combined(api_store, ble_store)
+    report.coverage = combined.coverage()
+    report.reconciliation = combined.reconcile(start=start, end=end)
     return report
 
 
@@ -130,7 +124,7 @@ async def _missing_address() -> Any:
 
 
 def _ble_capture(
-    store: Store,
+    ble_store: BleStore,
     address: str,
     config: Config,
     family: str | None,
@@ -143,7 +137,7 @@ def _ble_capture(
         address,
         family=family,
         seconds=seconds,
-        store=store,
+        store=ble_store,
         device_id=config.device_id or address,
         imu=imu,
     )

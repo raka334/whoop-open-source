@@ -1,15 +1,20 @@
-"""Unified local store.
+"""Separated local stores -- **one SQLite file per source**.
 
-Both data sources land in one SQLite database:
+The official API and the reverse-engineered BLE path are kept physically
+separate. Each gets its own file and its own tables, and nothing ever writes
+across:
 
-* Official API tables: ``cycles``, ``recoveries``, ``sleeps``, ``workouts``
-  (typed columns for the fields you actually query, plus ``raw_json`` for
-  everything else so nothing is ever lost).
-* BLE tables: ``hr_samples`` (live heart rate + R-R intervals) and
-  ``raw_packets`` (raw proprietary-channel frames).
-* Bookkeeping: ``oauth_tokens`` and ``source_sync`` (cursors).
+* :class:`ApiStore` -> ``data/whoop_api.sqlite``
+  ``cycles`` / ``recoveries`` / ``sleeps`` / ``workouts`` + OAuth tokens.
+* :class:`BleStore` -> ``data/whoop_ble.sqlite``
+  ``hr_samples`` / ``raw_packets`` / ``capture_sessions``.
 
-Timestamps are stored as ISO-8601 UTC strings so SQLite's date functions work.
+Cross-source work (coverage, reconciliation) lives in :mod:`whoop.reconcile`,
+which opens both files **read-only**. At rest the two sources never touch, so you
+can back up, delete, rebuild, or re-sync either one without the other.
+
+Timestamps are stored as ISO-8601 UTC strings, canonicalized to a trailing ``Z``
+so API values and BLE values compare equal when they are joined.
 """
 
 from __future__ import annotations
@@ -17,12 +22,24 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-SCHEMA = """
+# ===========================================================================
+# Schema
+# ===========================================================================
+SHARED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS source_sync (
+    source         TEXT NOT NULL,
+    resource       TEXT NOT NULL,
+    cursor         TEXT,
+    last_synced_at TEXT,
+    PRIMARY KEY (source, resource)
+);
+"""
+
+API_SCHEMA = """
 CREATE TABLE IF NOT EXISTS oauth_tokens (
     provider      TEXT PRIMARY KEY,
     access_token  TEXT,
@@ -34,15 +51,6 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     updated_at    TEXT
 );
 
-CREATE TABLE IF NOT EXISTS source_sync (
-    source         TEXT NOT NULL,
-    resource       TEXT NOT NULL,
-    cursor         TEXT,
-    last_synced_at TEXT,
-    PRIMARY KEY (source, resource)
-);
-
--- ------------------------------ Official API ------------------------------
 CREATE TABLE IF NOT EXISTS cycles (
     id                INTEGER PRIMARY KEY,
     user_id           INTEGER,
@@ -105,14 +113,15 @@ CREATE TABLE IF NOT EXISTS workouts (
     kilojoule         REAL,
     -- WHOOP 5/MG has NO GPS chip. The only location-like data is what the
     -- official API derives (usually from the paired phone), and it is coarse.
-    distance_meter    REAL,
-    altitude_gain_meter   REAL,
-    altitude_change_meter REAL,
+    distance_meter         REAL,
+    altitude_gain_meter    REAL,
+    altitude_change_meter  REAL,
     raw_json          TEXT,
     fetched_at        TEXT
 );
+"""
 
--- ---------------------------------- BLE -----------------------------------
+BLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS hr_samples (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id  TEXT,
@@ -137,7 +146,6 @@ CREATE TABLE IF NOT EXISTS raw_packets (
 );
 CREATE INDEX IF NOT EXISTS idx_raw_packets_ts ON raw_packets (device_id, ts);
 
--- One row per capture session, so a raw dump is reproducible/attributable.
 CREATE TABLE IF NOT EXISTS capture_sessions (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id    TEXT,
@@ -150,25 +158,13 @@ CREATE TABLE IF NOT EXISTS capture_sessions (
 );
 """
 
-# Columns added after the initial schema; applied to pre-existing databases.
-_MIGRATIONS = {
-    "raw_packets": {
-        "char_uuid": "TEXT",
-        "family": "TEXT",
-    },
-    "workouts": {
-        "altitude_gain_meter": "REAL",
-        "altitude_change_meter": "REAL",
-    },
-}
-
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _norm_ts(value: str | None) -> str | None:
-    """Canonicalize a timestamp so API ('…Z') and BLE ('…+00:00') compare equal."""
+    """Canonicalize a timestamp so API ('...Z') and BLE ('...+00:00') compare equal."""
     if value is None:
         return None
     if value.endswith("+00:00"):
@@ -186,25 +182,45 @@ def _get(d: dict[str, Any], *path: str, default: Any = None) -> Any:
     return default if cur is None else cur
 
 
-@dataclass
+# ===========================================================================
+# Base store
+# ===========================================================================
 class Store:
-    path: Path
+    """One SQLite file, one lock, shared read/export helpers.
 
-    def __post_init__(self) -> None:
-        self.path = Path(self.path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False + a lock lets the threaded web server share one
-        # connection safely while the CLI stays effectively single-threaded.
+    Instantiate a subclass (:class:`ApiStore`, :class:`BleStore`), or open an
+    existing file read-only with ``readonly=True`` (used by reconciliation).
+    """
+
+    KIND = "base"
+    SCHEMA = ""
+    TABLES: tuple[str, ...] = ()
+    MIGRATIONS: dict[str, dict[str, str]] = {}
+
+    def __init__(self, path: Path | str, *, readonly: bool = False) -> None:
+        self.path = Path(path)
+        self.readonly = readonly
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._migrate()
-        self._conn.commit()
+
+        if readonly:
+            uri = f"file:{self.path.as_posix()}?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(self.path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.executescript(SHARED_SCHEMA + self.SCHEMA)
+            self._migrate()
+            self._conn.commit()
+
+    # ----------------------------- lifecycle -----------------------------
+    def _ensure_writable(self) -> None:
+        if self.readonly:
+            raise RuntimeError(f"{self.KIND} store is read-only: {self.path}")
 
     def _migrate(self) -> None:
-        """Add columns introduced after the initial schema (idempotent)."""
-        for table, columns in _MIGRATIONS.items():
+        for table, columns in self.MIGRATIONS.items():
             existing = {
                 row["name"]
                 for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -215,15 +231,27 @@ class Store:
 
         # Idempotent BLE HR ingestion: collapse any pre-existing duplicates, then
         # enforce uniqueness so re-running a sync/backfill never double-counts.
-        self._conn.execute(
-            "DELETE FROM hr_samples WHERE id NOT IN ("
-            "  SELECT MIN(id) FROM hr_samples"
-            "  GROUP BY COALESCE(device_id, ''), ts, bpm)"
-        )
-        self._conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_samples_dedupe "
-            "ON hr_samples (COALESCE(device_id, ''), ts, bpm)"
-        )
+        if "hr_samples" in self.TABLES:
+            self._conn.execute(
+                "DELETE FROM hr_samples WHERE id NOT IN ("
+                "  SELECT MIN(id) FROM hr_samples"
+                "  GROUP BY COALESCE(device_id, ''), ts, bpm)"
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_samples_dedupe "
+                "ON hr_samples (COALESCE(device_id, ''), ts, bpm)"
+            )
+
+    def close(self) -> None:
+        if not self.readonly:
+            self._conn.commit()
+        self._conn.close()
+
+    def __enter__(self) -> "Store":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     # ------------------------------- reads -------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -235,67 +263,24 @@ class Store:
         rows = self.query(sql, params)
         return rows[0] if rows else None
 
-    # ----------------------------- lifecycle -----------------------------
-    def close(self) -> None:
-        self._conn.commit()
-        self._conn.close()
+    def count(self, table: str) -> int:
+        return self.query_one(f"SELECT COUNT(*) AS n FROM {table}")["n"]
 
-    def __enter__(self) -> "Store":
-        return self
+    def stats(self) -> dict[str, int]:
+        return {t: self.count(t) for t in self.TABLES}
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
-    # ------------------------------- tokens ------------------------------
-    def save_tokens(self, provider: str, payload: dict[str, Any]) -> None:
-        expires_at = None
-        if payload.get("expires_in"):
-            expires_at = datetime.fromtimestamp(
-                datetime.now(timezone.utc).timestamp() + int(payload["expires_in"]),
-                tz=timezone.utc,
-            ).isoformat(timespec="seconds")
-        with self._lock:
-            self._conn.execute(
-            """
-            INSERT INTO oauth_tokens
-                (provider, access_token, refresh_token, token_type, scope, expires_at, user_id, updated_at)
-            VALUES (:provider, :access_token, :refresh_token, :token_type, :scope, :expires_at, :user_id, :updated_at)
-            ON CONFLICT(provider) DO UPDATE SET
-                access_token  = excluded.access_token,
-                refresh_token = COALESCE(excluded.refresh_token, oauth_tokens.refresh_token),
-                token_type    = excluded.token_type,
-                scope         = excluded.scope,
-                expires_at    = excluded.expires_at,
-                updated_at    = excluded.updated_at
-            """,
-            {
-                "provider": provider,
-                "access_token": payload.get("access_token"),
-                "refresh_token": payload.get("refresh_token"),
-                "token_type": payload.get("token_type", "Bearer"),
-                "scope": payload.get("scope"),
-                "expires_at": expires_at,
-                "user_id": payload.get("user_id"),
-                "updated_at": _utcnow(),
-            },
-            )
-            self._conn.commit()
-
-    def load_tokens(self, provider: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM oauth_tokens WHERE provider = ?", (provider,)
-            ).fetchone()
-        if row is None:
-            return None
-        data = dict(row)
-        data["_expired"] = (
-            data["expires_at"] is not None and data["expires_at"] <= _utcnow()
-        )
-        return data
+    def export_rows(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return every column of every row in ``table`` (for NDJSON/CSV dumps)."""
+        if table not in self.TABLES:
+            raise ValueError(f"unknown table for {self.KIND}: {table}")
+        sql = f"SELECT * FROM {table}"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return self.query(sql)
 
     # ------------------------------- cursors -----------------------------
     def set_cursor(self, source: str, resource: str, cursor: str | None) -> None:
+        self._ensure_writable()
         with self._lock:
             self._conn.execute(
                 """
@@ -310,12 +295,88 @@ class Store:
             self._conn.commit()
 
     def get_cursor(self, source: str, resource: str) -> str | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT cursor FROM source_sync WHERE source = ? AND resource = ?",
-                (source, resource),
-            ).fetchone()
+        row = self.query_one(
+            "SELECT cursor FROM source_sync WHERE source = ? AND resource = ?",
+            (source, resource),
+        )
         return row["cursor"] if row else None
+
+    def _upsert(
+        self, table: str, rows: Sequence[dict[str, Any]], cols: Sequence[str], conflict: str
+    ) -> int:
+        self._ensure_writable()
+        if not rows:
+            return 0
+        placeholders = ", ".join(f":{c}" for c in cols)
+        updates = ", ".join(f"{c}=excluded.{c}" for c in cols if c != conflict)
+        sql = (
+            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT({conflict}) DO UPDATE SET {updates}"
+        )
+        with self._lock:
+            self._conn.executemany(sql, rows)
+            self._conn.commit()
+        return len(rows)
+
+
+# ===========================================================================
+# API store
+# ===========================================================================
+class ApiStore(Store):
+    """The official-API database. Never holds BLE data."""
+
+    KIND = "api"
+    SCHEMA = API_SCHEMA
+    TABLES = ("cycles", "recoveries", "sleeps", "workouts")
+    MIGRATIONS = {
+        "workouts": {
+            "altitude_gain_meter": "REAL",
+            "altitude_change_meter": "REAL",
+        }
+    }
+
+    # ------------------------------- tokens ------------------------------
+    def save_tokens(self, provider: str, payload: dict[str, Any]) -> None:
+        self._ensure_writable()
+        expires_at = None
+        if payload.get("expires_in"):
+            expires_at = datetime.fromtimestamp(
+                datetime.now(timezone.utc).timestamp() + int(payload["expires_in"]),
+                tz=timezone.utc,
+            ).isoformat(timespec="seconds")
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO oauth_tokens
+                    (provider, access_token, refresh_token, token_type, scope, expires_at, user_id, updated_at)
+                VALUES (:provider, :access_token, :refresh_token, :token_type, :scope, :expires_at, :user_id, :updated_at)
+                ON CONFLICT(provider) DO UPDATE SET
+                    access_token  = excluded.access_token,
+                    refresh_token = COALESCE(excluded.refresh_token, oauth_tokens.refresh_token),
+                    token_type    = excluded.token_type,
+                    scope         = excluded.scope,
+                    expires_at    = excluded.expires_at,
+                    updated_at    = excluded.updated_at
+                """,
+                {
+                    "provider": provider,
+                    "access_token": payload.get("access_token"),
+                    "refresh_token": payload.get("refresh_token"),
+                    "token_type": payload.get("token_type", "Bearer"),
+                    "scope": payload.get("scope"),
+                    "expires_at": expires_at,
+                    "user_id": payload.get("user_id"),
+                    "updated_at": _utcnow(),
+                },
+            )
+            self._conn.commit()
+
+    def load_tokens(self, provider: str) -> dict[str, Any] | None:
+        row = self.query_one("SELECT * FROM oauth_tokens WHERE provider = ?", (provider,))
+        if row is None:
+            return None
+        row["_expired"] = row["expires_at"] is not None and row["expires_at"] <= _utcnow()
+        return row
 
     # --------------------------- API upserts -----------------------------
     def upsert_cycles(self, records: Sequence[dict[str, Any]]) -> int:
@@ -444,24 +505,50 @@ class Store:
             conflict="id",
         )
 
-    def _upsert(
-        self, table: str, rows: Sequence[dict[str, Any]], cols: Sequence[str], conflict: str
-    ) -> int:
-        if not rows:
-            return 0
-        placeholders = ", ".join(f":{c}" for c in cols)
-        updates = ", ".join(f"{c}=excluded.{c}" for c in cols if c != conflict)
-        sql = (
-            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
-            f"ON CONFLICT({conflict}) DO UPDATE SET {updates}"
-        )
-        with self._lock:
-            self._conn.executemany(sql, rows)
-            self._conn.commit()
-        return len(rows)
+    def coverage(self) -> dict[str, dict[str, Any]]:
+        window = self.query_one(
+            "SELECT MIN(lo) AS lo, MAX(hi) AS hi FROM ("
+            "  SELECT MIN(start) AS lo, MAX(end) AS hi FROM cycles"
+            "  UNION ALL SELECT MIN(start), MAX(end) FROM sleeps"
+            "  UNION ALL SELECT MIN(start), MAX(end) FROM workouts)"
+        ) or {}
+        return {
+            "api": {
+                "start": _norm_ts(window.get("lo")),
+                "end": _norm_ts(window.get("hi")),
+                "rows": sum(self.count(t) for t in self.TABLES),
+            }
+        }
 
-    # ------------------------------ BLE writes ---------------------------
+    def cycles_with_hr(self) -> list[dict[str, Any]]:
+        """Windows + averaged HR that reconciliation compares against BLE."""
+        out: list[dict[str, Any]] = []
+        for kind, table in (("cycle", "cycles"), ("workout", "workouts")):
+            for r in self.query(
+                f"SELECT id, start, end, average_heart_rate, max_heart_rate FROM {table} "
+                "WHERE start IS NOT NULL AND end IS NOT NULL"
+            ):
+                r["kind"] = kind
+                out.append(r)
+        return out
+
+
+# ===========================================================================
+# BLE store
+# ===========================================================================
+class BleStore(Store):
+    """The strap database. Never holds API data."""
+
+    KIND = "ble"
+    SCHEMA = BLE_SCHEMA
+    TABLES = ("hr_samples", "raw_packets", "capture_sessions")
+    MIGRATIONS = {
+        "raw_packets": {"char_uuid": "TEXT", "family": "TEXT"},
+    }
+
+    # ------------------------------ HR samples ---------------------------
     def add_hr_samples(self, samples: Iterable[dict[str, Any]]) -> int:
+        self._ensure_writable()
         rows = [
             (
                 s.get("device_id") or "",
@@ -480,9 +567,50 @@ class Store:
                 rows,
             )
             self._conn.commit()
-            return cur.rowcount if cur.rowcount is not None else len(rows)
+            return max(cur.rowcount or 0, 0)
 
+    def hr_summary(self, start: str, end: str) -> dict[str, Any]:
+        row = self.query_one(
+            "SELECT COUNT(*) AS n, AVG(bpm) AS avg_bpm, MIN(bpm) AS min_bpm, "
+            "MAX(bpm) AS max_bpm FROM hr_samples WHERE ts >= ? AND ts <= ?",
+            (_norm_ts(start), _norm_ts(end)),
+        )
+        return row or {"n": 0, "avg_bpm": None, "min_bpm": None, "max_bpm": None}
+
+    def hr_series(
+        self, *, start: str | None = None, end: str | None = None, max_points: int = 900
+    ) -> list[dict[str, Any]]:
+        """HR over a window, bucket-averaged down to at most ``max_points``."""
+        where, params = [], []
+        if start:
+            where.append("ts >= ?")
+            params.append(_norm_ts(start))
+        if end:
+            where.append("ts <= ?")
+            params.append(_norm_ts(end))
+        sql = "SELECT ts, bpm FROM hr_samples"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY ts"
+        rows = self.query(sql, params)
+        if len(rows) <= max_points:
+            return rows
+        step = len(rows) / max_points
+        out: list[dict[str, Any]] = []
+        i = 0.0
+        while int(i) < len(rows):
+            chunk = rows[int(i) : int(i + step)] or [rows[int(i)]]
+            bpms = [c["bpm"] for c in chunk if c["bpm"] is not None]
+            if bpms:
+                out.append(
+                    {"ts": chunk[0]["ts"], "bpm": round(sum(bpms) / len(bpms), 1), "n": len(chunk)}
+                )
+            i += step
+        return out
+
+    # ------------------------------ raw packets --------------------------
     def add_raw_packet(self, packet: dict[str, Any]) -> None:
+        self._ensure_writable()
         with self._lock:
             self._conn.execute(
                 """
@@ -505,88 +633,22 @@ class Store:
             )
             self._conn.commit()
 
-    # ---------------------------- reconciliation -------------------------
-    def hr_summary(self, start: str, end: str) -> dict[str, Any]:
-        """BLE HR stats over an inclusive [start, end] window."""
-        row = self.query_one(
-            "SELECT COUNT(*) AS n, AVG(bpm) AS avg_bpm, MIN(bpm) AS min_bpm, "
-            "MAX(bpm) AS max_bpm FROM hr_samples WHERE ts >= ? AND ts <= ?",
-            (_norm_ts(start), _norm_ts(end)),
+    def recent_raw(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self.query(
+            "SELECT id, ts, family, channel, char_uuid, packet_type, command, hex "
+            "FROM raw_packets ORDER BY id DESC LIMIT ?",
+            (int(limit),),
         )
-        return row or {"n": 0, "avg_bpm": None, "min_bpm": None, "max_bpm": None}
 
-    def coverage(self) -> dict[str, dict[str, Any]]:
-        """What window each source actually covers, computed from stored data."""
-        api = self.query_one(
-            "SELECT MIN(lo) AS lo, MAX(hi) AS hi FROM ("
-            "  SELECT MIN(start) AS lo, MAX(end) AS hi FROM cycles"
-            "  UNION ALL SELECT MIN(start), MAX(end) FROM sleeps"
-            "  UNION ALL SELECT MIN(start), MAX(end) FROM workouts)"
-        ) or {}
-        api_rows = sum(
-            self.query_one(f"SELECT COUNT(*) AS n FROM {t}")["n"]
-            for t in ("cycles", "recoveries", "sleeps", "workouts")
-        )
-        hr = self.query_one(
-            "SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM hr_samples"
-        ) or {}
-        raw = self.query_one(
-            "SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM raw_packets"
-        ) or {}
-        return {
-            "api": {"start": _norm_ts(api.get("lo")), "end": _norm_ts(api.get("hi")), "rows": api_rows},
-            "ble_hr": {"start": hr.get("lo"), "end": hr.get("hi"), "rows": hr.get("n") or 0},
-            "ble_raw": {"start": raw.get("lo"), "end": raw.get("hi"), "rows": raw.get("n") or 0},
-        }
-
-    def reconcile(self, *, start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
-        """Compare each API cycle/workout HR against BLE samples in the same window.
-
-        The two sources are complementary, not duplicates -- but where they overlap
-        the high-rate BLE stream should corroborate the API's averaged HR. A large
-        delta is the signal that something is off (wrong device/day, or a gap).
-        """
-        out: list[dict[str, Any]] = []
-        for kind, table in (("cycle", "cycles"), ("workout", "workouts")):
-            for r in self.query(
-                f"SELECT * FROM {table} WHERE start IS NOT NULL AND end IS NOT NULL"
-            ):
-                if start and _norm_ts(r["end"]) < _norm_ts(start):
-                    continue
-                if end and _norm_ts(r["start"]) > _norm_ts(end):
-                    continue
-                s = self.hr_summary(r["start"], r["end"])
-                api_avg = r.get("average_heart_rate")
-                ble_avg = round(s["avg_bpm"], 1) if s.get("avg_bpm") is not None else None
-                out.append(
-                    {
-                        "kind": kind,
-                        "id": r["id"],
-                        "start": r["start"],
-                        "end": r["end"],
-                        "api_avg": api_avg,
-                        "api_max": r.get("max_heart_rate"),
-                        "ble_n": s.get("n") or 0,
-                        "ble_avg": ble_avg,
-                        "ble_max": s.get("max_bpm"),
-                        "delta": (
-                            round(ble_avg - api_avg, 1)
-                            if ble_avg is not None and api_avg is not None
-                            else None
-                        ),
-                    }
-                )
-        return out
-
-    # ------------------------------ capture ------------------------------
+    # ------------------------------ captures -----------------------------
     def start_capture(
         self, *, device_id: str, family: str, address: str, note: str | None = None
     ) -> int:
+        self._ensure_writable()
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO capture_sessions
-                    (device_id, family, address, started_at, note)
+                INSERT INTO capture_sessions (device_id, family, address, started_at, note)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (device_id, family, address, _utcnow(), note),
@@ -595,6 +657,7 @@ class Store:
             return int(cur.lastrowid)
 
     def finish_capture(self, session_id: int, packet_count: int) -> None:
+        self._ensure_writable()
         with self._lock:
             self._conn.execute(
                 "UPDATE capture_sessions SET ended_at = ?, packet_count = ? WHERE id = ?",
@@ -602,30 +665,14 @@ class Store:
             )
             self._conn.commit()
 
-    # -------------------------------- stats ------------------------------
-    TABLES = (
-        "cycles",
-        "recoveries",
-        "sleeps",
-        "workouts",
-        "hr_samples",
-        "raw_packets",
-        "capture_sessions",
-    )
-
-    def stats(self) -> dict[str, int]:
-        with self._lock:
-            return {
-                t: self._conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
-                for t in self.TABLES
-            }
-
-    # ------------------------------- export ------------------------------
-    def export_rows(self, table: str, limit: int | None = None) -> list[dict[str, Any]]:
-        """Return every column of every row in ``table`` (for NDJSON/CSV dumps)."""
-        if table not in self.TABLES:
-            raise ValueError(f"unknown table: {table}")
-        sql = f"SELECT * FROM {table}"
-        if limit is not None:
-            sql += f" LIMIT {int(limit)}"
-        return self.query(sql)
+    def coverage(self) -> dict[str, dict[str, Any]]:
+        hr = self.query_one(
+            "SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM hr_samples"
+        ) or {}
+        raw = self.query_one(
+            "SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM raw_packets"
+        ) or {}
+        return {
+            "ble_hr": {"start": hr.get("lo"), "end": hr.get("hi"), "rows": hr.get("n") or 0},
+            "ble_raw": {"start": raw.get("lo"), "end": raw.get("hi"), "rows": raw.get("n") or 0},
+        }

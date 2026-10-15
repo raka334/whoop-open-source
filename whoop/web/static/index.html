@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WHOOP · local</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14171c;
+    --panel-2: #1a1e25;
+    --line: #262b33;
+    --text: #e6e9ee;
+    --muted: #8b93a1;
+    --api: #6ea8fe;
+    --ble: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 18px 22px 0; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; background: rgba(11,13,16,.92); backdrop-filter: blur(8px); z-index: 5;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+  .brand span { color: var(--muted); font-size: 12px; }
+  .pills { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 12px; }
+  .pill {
+    font: 11px/1 var(--mono); color: var(--muted); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px;
+  }
+  .pill b { color: var(--text); font-weight: 600; }
+  .pill.api b { color: var(--api); }
+  .pill.ble b { color: var(--ble); }
+  nav { display: flex; gap: 4px; }
+  nav button {
+    background: none; border: none; color: var(--muted); font: 600 13px/1 inherit;
+    padding: 10px 12px; cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.on { color: var(--text); border-bottom-color: var(--text); }
+  nav button.on.api { border-bottom-color: var(--api); }
+  nav button.on.ble { border-bottom-color: var(--ble); }
+  main { padding: 18px 22px 60px; max-width: 1180px; }
+  section { display: none; }
+  section.on { display: block; }
+  .banner {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 16px;
+    padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel);
+    font-size: 13px; color: var(--muted);
+  }
+  .banner .tag { font: 600 11px/1 var(--mono); padding: 4px 8px; border-radius: 6px; }
+  .banner.api .tag { background: rgba(110,168,254,.14); color: var(--api); }
+  .banner.ble .tag { background: rgba(74,222,128,.14); color: var(--ble); }
+  .banner.cross .tag { background: rgba(251,191,36,.14); color: var(--warn); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card .k { font: 11px/1 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+  .card .v { font: 600 22px/1.2 var(--mono); margin-top: 6px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 22px 0 10px; font-weight: 600; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  select, input[type=text], input[type=number] {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font: 13px/1 var(--mono);
+  }
+  button.btn, a.btn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 12px; font: 600 12px/1 inherit; cursor: pointer; text-decoration: none;
+  }
+  button.btn:hover, a.btn:hover { border-color: #3a424e; }
+  button.btn.primary { background: #1d2a3f; border-color: #2b3d59; }
+  table { width: 100%; border-collapse: collapse; font: 12px/1.45 var(--mono); }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 10.5px; letter-spacing: .4px; position: sticky; top: 0; background: var(--panel); }
+  tbody tr:hover { background: var(--panel-2); }
+  td.num { text-align: right; }
+  .muted { color: var(--muted); }
+  .good { color: var(--ble); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); }
+  .scroll { max-height: 460px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+  .empty { color: var(--muted); padding: 18px; text-align: center; font-size: 13px; }
+  .chartwrap { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--panel-2); }
+  svg { display: block; width: 100%; height: 240px; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  code { font-family: var(--mono); }
+  .hexcell { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #toast {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: #2a1f22; border: 1px solid #5b2b32; color: #ffd9d9; padding: 10px 14px;
+    border-radius: 8px; font-size: 13px; display: none; z-index: 20; max-width: 80vw;
+  }
+  .sep { height: 1px; background: var(--line); margin: 18px 0; }
+  .kv { font: 12px/1.6 var(--mono); color: var(--muted); }
+  .kv b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>WHOOP · local</h1>
+    <span>two sources, two databases, one dashboard</span>
+  </div>
+  <div class="pills" id="pills"><span class="pill">connecting…</span></div>
+  <nav>
+    <button data-tab="api" class="api">API source</button>
+    <button data-tab="ble" class="ble">BLE source</button>
+    <button data-tab="cross">Cross-source</button>
+    <button data-tab="tools">Tools</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ============================ API ============================ -->
+  <section id="tab-api">
+    <div class="banner api"><span class="tag">API</span>
+      Official WHOOP Developer API v2 — computed daily metrics, in its own database.
+      <span class="muted" id="api-db"></span>
+    </div>
+    <div class="cards" id="api-cards"></div>
+    <div class="panel" id="api-auth"></div>
+
+    <h2>Browse API tables</h2>
+    <div class="panel">
+      <div class="row">
+        <select id="api-table"></select>
+        <input type="number" id="api-limit" value="100" min="1" max="5000" style="width:90px" />
+        <button class="btn" id="api-load">Load</button>
+        <span class="muted" id="api-count"></span>
+        <span style="flex:1"></span>
+        <a class="btn" id="api-dl-nd" download>⬇ NDJSON</a>
+        <a class="btn" id="api-dl-csv" download>⬇ CSV</a>
+      </div>
+      <div class="scroll" style="margin-top:12px"><table id="api-table-view"><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- ============================ BLE ============================ -->
+  <section id="tab-ble">
+    <div class="banner ble"><span class="tag">BLE</span>
+      Reverse-engineered strap data — raw, high-rate, in its own database.
+      <span class="muted" id="ble-db"></span>
+    </div>
+    <div class="cards" id="ble-cards"></div>
+
+    <h2>Heart rate</h2>
+    <div class="panel">
+      <div class="row">
+        <input type="text" id="hr-start" placeholder="start (ISO, optional)" style="width:230px" />
+        <input type="text" id="hr-end" placeholder="end (ISO, optional)" style="width:230px" />
+        <button class="btn primary" id="hr-load">Load chart</button>
+        <span class="muted" id="hr-summary"></span>
+      </div>
+      <div class="chartwrap" style="margin-top:12px">
+        <svg id="hr-chart" viewBox="0 0 1000 240" preserveAspectRatio="none"></svg>
+        <div class="legend"><span>min <b id="hr-min">–</b></span><span>max <b id="hr-max">–</b></span><span>buckets <b id="hr-n">–</b></span></div>
+      </div>
+    </div>
+
+    <h2>Recent raw frames</h2>
+    <div class="panel">
+      <div class="row">
+        <button class="btn" id="raw-load">Refresh</button>
+        <label class="muted">limit <input type="number" id="raw-limit" value="100" min="1" max="2000" style="width:80px" /></label>
+      </div>
+      <div class="scroll" style="margin-top:12px"><table id="raw-view"><tbody></tbody></table></div>
+    </div>
+
+    <h2>Browse BLE tables</h2>
+    <div class="panel">
+      <div class="row">
+        <select id="ble-table"></select>
+        <input type="number" id="ble-limit" value="100" min="1" max="5000" style="width:90px" />
+        <button class="btn" id="ble-load">Load</button>
+        <span class="muted" id="ble-count"></span>
+        <span style="flex:1"></span>
+        <a class="btn" id="ble-dl-nd" download>⬇ NDJSON</a>
+        <a class="btn" id="ble-dl-csv" download>⬇ CSV</a>
+      </div>
+      <div class="scroll" style="margin-top:12px"><table id="ble-table-view"><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- =========================== CROSS =========================== -->
+  <section id="tab-cross">
+    <div class="banner cross"><span class="tag">READ-ONLY</span>
+      The only place the two databases are joined. Nothing here writes to either source.
+    </div>
+
+    <h2>Coverage</h2>
+    <div class="panel"><div id="cov"></div></div>
+
+    <h2>Reconciliation · API average HR vs BLE samples</h2>
+    <div class="panel">
+      <div class="row">
+        <input type="text" id="rec-start" placeholder="start (optional)" style="width:230px" />
+        <input type="text" id="rec-end" placeholder="end (optional)" style="width:230px" />
+        <button class="btn primary" id="rec-load">Reconcile</button>
+        <span class="muted" id="rec-flag"></span>
+      </div>
+      <div class="scroll" style="margin-top:12px"><table id="rec-view"><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- =========================== TOOLS =========================== -->
+  <section id="tab-tools">
+    <h2>Decode a protocol frame</h2>
+    <div class="panel">
+      <div class="row">
+        <input type="text" id="fx-input" placeholder="aa0108000001e67123019101363e5c8d" style="flex:1; min-width:260px" />
+        <button class="btn primary" id="fx-go">Decode</button>
+      </div>
+      <div class="panel" style="background:var(--panel-2); margin-top:12px"><div id="fx-out" class="kv">Family is auto-detected (WHOOP 4 CRC8 vs WHOOP 5/MG CRC16-Modbus).</div></div>
+    </div>
+
+    <h2>Retention &amp; the GPS myth</h2>
+    <div class="panel kv">
+      <div>On-device retention: <b>up to ~14 days</b> (WHOOP support docs). Catch-up can take ~1 hour.</div>
+      <div>Durable store: <b>type-47 historical record</b> in a page-slot ring buffer (bounds via <code>GET_DATA_RANGE</code>).</div>
+      <div>Removal: the <b>acknowledged/trim boundary</b> advances only on <code>HISTORICAL_DATA_RESULT</code> (cmd 23) after a durable local commit.</div>
+      <div>GPS: <b>there is none.</b> WHOOP 5/MG has no GNSS chip; API distance/altitude is phone-derived.</div>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg; t.style.display = "block";
+  setTimeout(() => (t.style.display = "none"), 4200);
+}
+
+async function getJSON(path) {
+  const res = await fetch(path);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || res.statusText);
+  return body;
+}
+
+/* ------------------------------- tabs ------------------------------- */
+document.querySelectorAll("nav button").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll("nav button").forEach((x) => x.classList.remove("on"));
+    document.querySelectorAll("section").forEach((x) => x.classList.remove("on"));
+    b.classList.add("on");
+    $("#tab-" + b.dataset.tab).classList.add("on");
+  };
+});
+
+/* ------------------------------- renderers ------------------------------- */
+function renderTable(el, rows) {
+  if (!rows || !rows.length) { el.innerHTML = '<tbody><tr><td class="empty">no rows</td></tr></tbody>'; return; }
+  const cols = Object.keys(rows[0]);
+  const head = cols.map((c) => `<th>${esc(c)}</th>`).join("");
+  const body = rows.map((r) => "<tr>" + cols.map((c) => {
+    const v = r[c];
+    if (typeof v === "number") return `<td class="num">${v}</td>`;
+    const s = v === null || v === undefined ? "" : String(v);
+    const short = s.length > 70 ? s.slice(0, 70) + "…" : s;
+    return `<td title="${esc(s.slice(0, 300))}">${esc(short)}</td>`;
+  }).join("") + "</tr>").join("");
+  el.innerHTML = `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`;
+}
+
+function cards(el, obj) {
+  el.innerHTML = Object.entries(obj).map(([k, v]) =>
+    `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("");
+}
+
+/* ------------------------------- health ------------------------------- */
+async function init() {
+  try {
+    const h = await getJSON("/api/health");
+    const pills = [`<span class="pill">sources <b>${h.sources.join(" + ")}</b></span>`];
+    if (h.databases.api) pills.push(`<span class="pill api">api <b>${esc(h.databases.api.split("/").pop())}</b></span>`);
+    if (h.databases.ble) pills.push(`<span class="pill ble">ble <b>${esc(h.databases.ble.split("/").pop())}</b></span>`);
+    $("#pills").innerHTML = pills.join("");
+  } catch (e) { toast("health: " + e.message); }
+
+  await loadApi();
+  await loadBle();
+  await loadCross();
+}
+
+/* ------------------------------- API tab ------------------------------- */
+async function loadApi() {
+  try {
+    const s = await getJSON("/api/api/summary");
+    $("#api-db").textContent = s.db;
+    cards($("#api-cards"), s.stats);
+    const a = s.auth || {};
+    $("#api-auth").innerHTML =
+      `<div class="kv">auth: <b class="${a.authenticated ? "good" : "bad"}">${a.authenticated ? "connected" : "not connected"}</b>` +
+      (a.scope ? ` · scope <b>${esc(a.scope)}</b>` : "") +
+      (a.expires_at ? ` · expires <b>${esc(a.expires_at)}</b>${a.expired ? ' <span class="bad">(expired — will refresh)</span>' : ""}` : "") +
+      (a.authenticated ? "" : ` <span class="muted">— run <code>whoop api auth-url</code></span>`) + "</div>";
+
+    const sel = $("#api-table");
+    sel.innerHTML = s.tables.map((t) => `<option>${esc(t)}</option>`).join("");
+    sel.onchange = () => apiLoadRows();
+    $("#api-load").onclick = () => apiLoadRows();
+    apiLoadRows();
+  } catch (e) { toast("api summary: " + e.message); }
+}
+
+async function apiLoadRows() {
+  const table = $("#api-table").value, limit = $("#api-limit").value || 100;
+  $("#api-dl-nd").href = `/api/api/export?table=${table}&format=ndjson`;
+  $("#api-dl-csv").href = `/api/api/export?table=${table}&format=csv`;
+  try {
+    const d = await getJSON(`/api/api/rows?table=${table}&limit=${limit}`);
+    $("#api-count").textContent = `${d.rows.length} of ${d.total}`;
+    renderTable($("#api-table-view"), d.rows);
+  } catch (e) { toast("api rows: " + e.message); }
+}
+
+/* ------------------------------- BLE tab ------------------------------- */
+async function loadBle() {
+  try {
+    const s = await getJSON("/api/ble/summary");
+    $("#ble-db").textContent = s.db;
+    cards($("#ble-cards"), s.stats);
+
+    const sel = $("#ble-table");
+    sel.innerHTML = s.tables.map((t) => `<option>${esc(t)}</option>`).join("");
+    sel.onchange = () => bleLoadRows();
+    $("#ble-load").onclick = () => bleLoadRows();
+    bleLoadRows();
+    bleLoadRaw();
+    $("#raw-load").onclick = bleLoadRaw;
+    $("#raw-limit").onchange = bleLoadRaw;
+    $("#hr-load").onclick = bleLoadHr;
+    bleLoadHr();
+  } catch (e) { toast("ble summary: " + e.message); }
+}
+
+async function bleLoadRows() {
+  const table = $("#ble-table").value, limit = $("#ble-limit").value || 100;
+  $("#ble-dl-nd").href = `/api/ble/export?table=${table}&format=ndjson`;
+  $("#ble-dl-csv").href = `/api/ble/export?table=${table}&format=csv`;
+  try {
+    const d = await getJSON(`/api/ble/rows?table=${table}&limit=${limit}`);
+    $("#ble-count").textContent = `${d.rows.length} of ${d.total}`;
+    renderTable($("#ble-table-view"), d.rows);
+  } catch (e) { toast("ble rows: " + e.message); }
+}
+
+async function bleLoadRaw() {
+  const limit = $("#raw-limit").value || 100;
+  try {
+    const d = await getJSON(`/api/ble/raw?limit=${limit}`);
+    renderTable($("#raw-view"), d.rows);
+  } catch (e) { toast("raw: " + e.message); }
+}
+
+async function bleLoadHr() {
+  const p = new URLSearchParams({ max_points: 900 });
+  if ($("#hr-start").value) p.set("start", $("#hr-start").value);
+  if ($("#hr-end").value) p.set("end", $("#hr-end").value);
+  try {
+    const d = await getJSON(`/api/ble/hr?${p}`);
+    const s = d.series;
+    if (!s.length) { $("#hr-chart").innerHTML = '<text x="500" y="120" fill="#8b93a1" text-anchor="middle" font-size="13">no heart-rate samples yet</text>'; return; }
+    const bpms = s.map((r) => r.bpm);
+    const lo = Math.min(...bpms), hi = Math.max(...bpms), span = Math.max(hi - lo, 1);
+    const pts = s.map((r, i) => {
+      const x = (i / Math.max(s.length - 1, 1)) * 1000;
+      const y = 230 - ((r.bpm - lo) / span) * 210;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    const area = `0,240 ${pts} 1000,240`;
+    $("#hr-chart").innerHTML =
+      `<polygon points="${area}" fill="rgba(74,222,128,.12)"></polygon>` +
+      `<polyline points="${pts}" fill="none" stroke="#4ade80" stroke-width="1.6"></polyline>`;
+    $("#hr-min").textContent = lo; $("#hr-max").textContent = hi; $("#hr-n").textContent = s.length;
+    const sum = d.summary || {};
+    $("#hr-summary").textContent = sum.n ? `${sum.n} samples · avg ${Math.round(sum.avg_bpm)} bpm` : "";
+  } catch (e) { toast("hr: " + e.message); }
+}
+
+/* ------------------------------ CROSS tab ------------------------------ */
+async function loadCross() {
+  try {
+    const c = await getJSON("/api/coverage");
+    const rows = Object.entries(c).map(([src, v]) =>
+      `<tr><td>${esc(src)}</td><td class="num">${v.rows ?? 0}</td><td>${esc(v.start || "–")}</td><td>${esc(v.end || "–")}</td></tr>`).join("");
+    $("#cov").innerHTML = `<table><thead><tr><th>source</th><th>rows</th><th>covers from</th><th>covers to</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch (e) { toast("coverage: " + e.message); }
+  recLoad();
+  $("#rec-load").onclick = recLoad;
+}
+
+async function recLoad() {
+  const p = new URLSearchParams();
+  if ($("#rec-start").value) p.set("start", $("#rec-start").value);
+  if ($("#rec-end").value) p.set("end", $("#rec-end").value);
+  try {
+    const d = await getJSON(`/api/reconcile?${p}`);
+    const rows = d.rows.map((r) => {
+      const dlt = r.delta;
+      const cls = dlt === null ? "muted" : Math.abs(dlt) >= 10 ? "bad" : "good";
+      return `<tr><td>${esc(r.kind)}</td><td>${esc(String(r.id).slice(0,14))}</td>` +
+        `<td>${esc(r.start || "")}</td><td class="num">${r.api_avg ?? "–"}</td>` +
+        `<td class="num">${r.ble_avg ?? "–"}</td><td class="num">${r.ble_n}</td>` +
+        `<td class="num ${cls}">${dlt ?? "–"}</td></tr>`;
+    }).join("");
+    $("#rec-view").innerHTML = `<thead><tr><th>kind</th><th>id</th><th>start</th><th>api avg</th><th>ble avg</th><th>ble n</th><th>delta</th></tr></thead><tbody>${rows || '<tr><td class="empty">no overlapping windows</td></tr>'}</tbody>`;
+    $("#rec-flag").textContent = d.flagged ? `${d.flagged} window(s) need a look` : "";
+  } catch (e) { toast("reconcile: " + e.message); }
+}
+
+/* ------------------------------- TOOLS ------------------------------- */
+$("#fx-go").onclick = async () => {
+  const hex = $("#fx-input").value.trim();
+  if (!hex) return;
+  try {
+    const d = await getJSON(`/api/frames?hex=${encodeURIComponent(hex)}`);
+    const f = d.frames[0] || {};
+    $("#fx-out").innerHTML = f.error
+      ? `<span class="bad">${esc(f.error)}</span>`
+      : `<div>family <b>${esc(f.family)}</b> · name <b>${esc(f.name)}</b> · crc <b class="${f.valid_crc ? "good" : "bad"}">${f.valid_crc ? "valid" : "INVALID"}</b></div>` +
+        `<div>packet_type <b>${esc(f.packet_type)}</b> · seq <b>${f.sequence}</b> · cmd <b>${esc(f.command)}</b></div>` +
+        `<div>data <b>${esc(f.data)}</b></div>`;
+  } catch (e) { toast("frames: " + e.message); }
+};
+$("#fx-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#fx-go").click(); });
+
+/* expose a tiny debug hook for tests */
+window.__whoop = { getJSON };
+
+init();
+</script>
+</body>
+</html>

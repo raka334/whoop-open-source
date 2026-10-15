@@ -1,20 +1,40 @@
 # whoop-open-source
 
-A unified WHOOP data pipeline (4.0 and 5.0/MG): pull **processed metrics from the
-official API** *and* **raw sensor data straight off the strap over BLE**, and land
-both in one local SQLite store.
+A two-source WHOOP data pipeline (4.0 and 5.0/MG): pull **processed metrics from
+the official API** *and* mine **raw sensor data straight off the strap over BLE**
+— into **two separate local SQLite databases**.
 
 ```
-                  ┌───────────────────────┐
-  Official API ──▶│                       │
-  (OAuth2, v2)    │   unified Store       │◀── cycles / recoveries / sleeps / workouts
-                  │   (SQLite)            │
-  BLE strap    ──▶│                       │◀── hr_samples / raw_packets
-  (fd4b protocol) │                       │
-                  └───────────────────────┘
+   Official API ──▶  data/whoop_api.sqlite   cycles / recoveries / sleeps / workouts
+   (OAuth2, v2)      ────────────────────
+                            │  both read-only, on demand
+                            ▼
+                     whoop reconcile  ──▶  coverage + HR cross-check
+                            ▲
+   BLE strap    ──▶  data/whoop_ble.sqlite   hr_samples / raw_packets / capture_sessions
+   (fd4b protocol)
 ```
 
 There is no cloud component. Everything is local and inspectable.
+
+## The two sources are kept separate
+
+The API data and the BLE data never share a file, a table, or a transaction:
+
+| | `data/whoop_api.sqlite` | `data/whoop_ble.sqlite` |
+|---|---|---|
+| Written by | `whoop api …` | `whoop ble …` |
+| Tables | `cycles`, `recoveries`, `sleeps`, `workouts`, `oauth_tokens` | `hr_samples`, `raw_packets`, `capture_sessions` |
+| Contains the other's tables? | no | no |
+
+So you can back up, delete, rebuild, or re-sync **either side without the other**.
+The only thing that reads both is `whoop reconcile` (and the dashboard's
+cross-source tab), and it opens both files **read-only** — a reconciliation run
+can never mutate either source. Each store refuses writes from the other's
+methods, and there is no shared "unified" write path to get them confused.
+
+> The old single-file `data/whoop.sqlite` is no longer used. Delete it (or leave
+> it); the two new files are created on first write.
 
 ## Why two paths?
 
@@ -33,17 +53,21 @@ Use the API for reliable daily metrics and the BLE path for raw/real-time data.
 
 ```
 whoop/
-├── config.py             env/.env configuration
-├── store.py              unified SQLite schema + upserts (the shared seam)
-├── sync.py               concurrent dual-source sync + coverage/reconciliation
-├── api/                  official Developer API v2
+├── config.py             env/.env configuration (paths to both databases)
+├── store.py              two stores: ApiStore + BleStore (separate schemas)
+├── reconcile.py          read-only join across both (coverage + HR check)
+├── sync.py               concurrent dual-source sync into both stores
+├── api/                  official Developer API v2  -> whoop_api.sqlite
 │   ├── oauth.py          authorization-code flow + refresh
 │   ├── client.py         authenticated GET + pagination
-│   └── sync.py           pull collections into the store
-├── ble/                  reverse-engineered strap protocol
+│   └── sync.py           pull collections into the API store
+├── ble/                  reverse-engineered strap protocol -> whoop_ble.sqlite
 │   ├── protocol.py       family-aware framing (WHOOP 4 + 5/MG), CRCs, commands, safety
 │   ├── sensors.py        WHOOP 5/MG decoders (packet 40 live HR, R21 IMU burst)
 │   └── stream.py         scan / HR stream / probe / full raw capture (bleak)
+├── web/                  local dashboard (stdlib HTTP server, no build step)
+│   ├── server.py         JSON API, one namespace per source
+│   └── static/index.html single-file UI, offline, no CDN
 └── cli.py                command-line entry point
 ```
 
@@ -55,41 +79,57 @@ pip install -e '.[ble,dev]'     # drop [ble] if you only want the API side
 cp .env.example .env            # fill in API credentials
 ```
 
-The API half has **zero runtime dependencies** (stdlib `urllib`). `bleak` is only needed
-for BLE commands.
+The API half has **zero runtime dependencies** (stdlib `urllib`). `bleak` is only
+needed for BLE commands. The dashboard needs no dependencies at all.
 
 ## Usage
 
-### Official API (v2)
+### Official API (v2) → `whoop_api.sqlite`
 
-Register an app at <https://developer-dashboard.whoop.com>, put the client id/secret in
-`.env`, then:
+Register an app at <https://developer-dashboard.whoop.com>, put the client
+id/secret in `.env`, then:
 
 ```bash
-whoop auth-url                 # open the printed URL, approve, copy the `code`
-whoop auth-exchange '<code>'   # stores access + refresh tokens in the DB
-whoop sync                     # pulls cycles, recoveries, sleeps, workouts
-whoop sync --start 2026-01-01T00:00:00Z --resources recovery,sleeps
+whoop api auth-url                 # open the printed URL, approve, copy the `code`
+whoop api auth-exchange '<code>'   # stores access + refresh tokens in the API db
+whoop api sync                     # pulls cycles, recoveries, sleeps, workouts
+whoop api sync --start 2026-01-01T00:00:00Z --resources recovery,sleeps
+whoop api stats                    # row counts in the API database
 ```
 
 Tokens auto-refresh on expiry. Collection endpoints paginate automatically.
 
-### Sync both sources at once
+### BLE strap → `whoop_ble.sqlite`
+
+```bash
+whoop ble scan                 # find the strap, copy the address into .env
+whoop ble hr --seconds 120     # live HR + R-R intervals -> hr_samples (works on macOS)
+whoop ble probe --seconds 30   # vendor handshake + dump those channels -> raw_packets
+whoop ble capture --seconds 120 --imu   # full GATT enum + every notify char
+whoop ble stats                # row counts in the BLE database
+whoop retention                # what the strap keeps on-device, and the GPS caveat
+```
+
+`capture` enumerates the whole GATT tree, subscribes to **every** notifiable
+characteristic, and stores each frame with its `char_uuid` and detected family —
+nothing is decoded away. `--imu` also arms the 100 Hz raw-motion producer.
+
+### Both at once
 
 ```bash
 whoop sync-all                       # API pull + BLE mine, concurrently
 whoop sync-all --seconds 120 --imu   # longer BLE window, also arm raw motion
 whoop sync-all --no-ble              # API only (e.g. strap not nearby)
-whoop reconcile                      # cross-check API metrics vs BLE data
+whoop reconcile                      # read-only join across both databases
 ```
 
 `sync-all` runs the API pull on a worker thread and the BLE capture on the event
-loop **at the same time**, into the one store. The store serializes writes with a
-single lock, so neither source blocks the other and a failure in one never rolls
-back the other — you get a per-source report instead of an all-or-nothing result:
+loop **at the same time**, each into its **own** file. Neither source blocks the
+other and a failure in one never touches the other's database — you get a
+per-source report instead of an all-or-nothing result:
 
 ```
-== dual-source sync (concurrent) ==
+== dual-source sync (concurrent, separate files) ==
   api.cycles         1
   api.sleeps         1
   ble.packets      412 (family=whoop5, 3 notify chars)
@@ -108,30 +148,35 @@ reconciliation (API average HR vs BLE samples in the same window):
   their overlap is a cross-check, and a big delta means something's off (wrong
   device/day, or a gap). Timestamps are canonicalized (`…Z`) so both sides compare.
 
-Neither source replaces the other: the **API** gives WHOOP's computed daily
-metrics, the **BLE** path gives raw high-rate data. Sync both.
-
-### BLE (raw path)
+### Web dashboard
 
 ```bash
-whoop ble-scan                 # find the strap, copy the address into .env
-whoop ble-hr --seconds 120     # live HR + R-R intervals -> hr_samples (works on macOS)
-whoop ble-probe --seconds 30   # vendor handshake + dump those channels -> raw_packets
-whoop capture --seconds 120 --imu   # full GATT enum + every notify char -> raw_packets
-whoop stats                    # row counts for everything
-whoop retention                # what the strap keeps on-device, and the GPS caveat
+whoop web                      # both sources -> http://127.0.0.1:8765/
+whoop web --source ble         # only the strap database
+whoop web --source api --open  # only the API database, and open a browser
 ```
 
-`capture` enumerates the whole GATT tree, subscribes to **every** notifiable
-characteristic, and stores each frame with its `char_uuid` and detected family —
-nothing is decoded away. `--imu` also arms the 100 Hz raw-motion producer.
+One page, four tabs, **the two datasets in fully separate panels**:
+
+- **API source** — row counts, OAuth status, and a browser for `cycles`,
+  `recoveries`, `sleeps`, `workouts` with NDJSON/CSV download.
+- **BLE source** — row counts, capture sessions, and a browser plus a live
+  **heart-rate chart** (inline SVG, bucket-averaged) over `hr_samples`, and the
+  most recent **raw frames** with their `char_uuid`/family.
+- **Cross-source** *(read-only badge)* — the coverage table and the
+  reconciliation table, where |delta| ≥ 10 bpm is highlighted.
+- **Tools** — paste a frame to decode it, plus the retention/GPS caveats.
+
+Stdlib `http.server` + a single self-contained HTML file: no build step, no CDN,
+fully offline. The JSON API is namespaced by source (`/api/api/…`, `/api/ble/…`);
+the only cross-source endpoints are `/api/coverage` and `/api/reconcile`.
 
 ### Export everything
 
 ```bash
-whoop export                              # every table as NDJSON to stdout
-whoop export --format csv --dest ./dump   # one CSV per table on disk
-whoop export --table raw_packets           # just the raw frames
+whoop api export                           # every API table as NDJSON to stdout
+whoop ble export --table raw_packets        # just the raw frames
+whoop ble export --format csv --dest ./dump # one CSV per table on disk
 ```
 
 ### Protocol debugging
@@ -223,8 +268,8 @@ after the strap has been enrolled once in the official app.
 ### Platform gotcha
 
 The vendor channel requires a **bonded/encrypted** link. On macOS, Python/`bleak`
-gets `Encryption is insufficient` after app-pairing, so `ble-probe`/`capture`
-often return zero packets there. The proven-on-macOS path is **`ble-hr`**
+gets `Encryption is insufficient` after app-pairing, so `ble probe`/`capture`
+often return zero packets there. The proven-on-macOS path is **`ble hr`**
 (standard `0x2A37`). For full vendor capture, run on Linux (BlueZ, which can bond)
 or use the iOS CoreBluetooth projects below.
 
@@ -254,7 +299,9 @@ Not medical advice.
 - [x] Raw capture: full GATT enum + every notify char + `char_uuid` provenance
 - [x] Command write-safety classification (unknown opcodes blocked)
 - [x] NDJSON/CSV export of every table
-- [x] Concurrent dual-source sync (`sync-all`) + coverage/reconciliation
+- [x] Concurrent dual-source sync (`sync-all`) + read-only coverage/reconciliation
+- [x] Separate databases per source (API vs BLE), separate CLI groups and web endpoints
+- [x] Local web dashboard (heart-rate chart, raw frames, coverage, reconciliation, frame decoder)
 - [ ] BLE history offload loop (durable-commit-then-ACK, replay-safe)
 - [ ] HCI-log ingest (iOS `.pklg` / Android `btsnoop`) -> frame store
 - [ ] Ground-truth correlator against the official CSV export

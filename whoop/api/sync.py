@@ -1,4 +1,4 @@
-"""Pull official API collections into the unified store."""
+"""Pull official API collections into the API store (``whoop_api.sqlite``)."""
 
 from __future__ import annotations
 
