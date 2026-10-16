@@ -59,7 +59,10 @@ other. Python 3, stdlib-only for the API side; `bleak` only for BLE.
 - HCI-log ingest (iOS `.pklg` / Android `btsnoop`) → frame store
 - Ground-truth correlator against official CSV export
 - Decode remaining 5/MG records (R18/R20/R22/R26) — needs a real Linux capture
+  **or** static pass over the captured NORDIC 3.30.5.0 firmware
+  (`docs/firmware_fetch.md`)
 - Webhook receiver for API push updates
+- `whoop firmware fetch` command (port `~/whoop-re/fw_with_token.py`)
 
 ## Gotchas that will bite you
 
@@ -89,6 +92,12 @@ other. Python 3, stdlib-only for the API side; `bleak` only for BLE.
 | `whoop/reconcile.py` | read-only cross-source join |
 | `whoop/web/` | stdlib dashboard, one panel per source |
 | `whoop/cli.py` | every command |
+| `tools/esp32_bridge.py` | serial→SQLite bridge for the ESP32-S3 strap client |
+| `docs/WHOOP5_FULL_WRITEUP.md` | master narrative: E2E export, firmware, auth, BLE audit, ESP32 breakthrough |
+| `docs/esp32_bridge.md` | ESP32 pairing recipe + protocol session (the crown jewels) |
+| `docs/e2e_export_re.md` | E2E full-data-export RE ledger (app holds no key; server emails export) |
+| `docs/firmware_fetch.md` | firmware-service v4 fetch ledger — NORDIC 3.30.5.0 image captured |
+| `docs/ble_live_linux.md` | Linux BLE session, GATT map, pairing policy, CVE audit |
 | `tests/` | 51 tests, no hardware needed |
 
 ## Legal
