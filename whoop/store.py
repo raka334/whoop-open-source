@@ -266,6 +266,17 @@ class Store:
     def count(self, table: str) -> int:
         return self.query_one(f"SELECT COUNT(*) AS n FROM {table}")["n"]
 
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
+        """Execute one write statement and commit immediately.
+
+        Unlike :meth:`query`, this is safe for tools (e.g. the ESP32 bridge)
+        that insert rows while other processes read the database.
+        """
+        self._ensure_writable()
+        with self._lock:
+            self._conn.execute(sql, params)
+            self._conn.commit()
+
     def stats(self) -> dict[str, int]:
         return {t: self.count(t) for t in self.TABLES}
 
